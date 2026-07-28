@@ -65,7 +65,12 @@ export const useAppStore = create<AppStore>((set) => ({
       indexingStatus: null,
       repositoryFiles: [],
     }),
-  setRepositoryFiles: (files) => set({ repositoryFiles: files }),
+  setRepositoryFiles: (files) => set({
+    repositoryFiles: files.map((file) => ({
+      ...file,
+      path: file.path.replace(/\\/g, '/'),
+    })),
+  }),
   setIndexingStatus: (status) => set({ indexingStatus: status }),
 
   // Editor state

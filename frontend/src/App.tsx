@@ -37,9 +37,7 @@ export default function App() {
 
     apiClient.connectCompletion(
       currentRepository.id,
-      (message) => {
-        console.log('Completion message:', message);
-      },
+      () => undefined,
       (error) => {
         console.error('Completion error:', error);
       }

@@ -13,6 +13,11 @@ const WS_BASE_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
 class APIClient {
   private client: AxiosInstance;
   private wsConnections: Map<string, WebSocket> = new Map();
+  private pendingCompletion: {
+    resolve: (text: string) => void;
+    reject: (error: Error) => void;
+    buffer: string;
+  } | null = null;
 
   constructor() {
     this.client = axios.create({
@@ -55,8 +60,9 @@ class APIClient {
   }
 
   async readFile(repoId: string, filePath: string): Promise<string> {
+    const normalizedPath = filePath.replace(/\\/g, '/');
     const response = await this.client.get(
-      `/api/repositories/${repoId}/file/${filePath}`
+      `/api/repositories/${repoId}/file/${normalizedPath}`
     );
     return response.data.content;
   }
@@ -147,6 +153,20 @@ class APIClient {
     ws.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
+        if (this.pendingCompletion) {
+          if (message.type === 'completion' && message.text) {
+            this.pendingCompletion.buffer += message.text;
+          } else if (message.type === 'end') {
+            const text = this.pendingCompletion.buffer;
+            const { resolve } = this.pendingCompletion;
+            this.pendingCompletion = null;
+            resolve(text);
+          } else if (message.type === 'error') {
+            const { reject } = this.pendingCompletion;
+            this.pendingCompletion = null;
+            reject(new Error(message.error || 'Completion failed'));
+          }
+        }
         onMessage(message);
       } catch (error) {
         console.error('Failed to parse completion message:', error);
@@ -172,9 +192,53 @@ class APIClient {
     prompt: string,
     filePath?: string,
     language?: string
-  ): Promise<void> {
-    const ws = this.wsConnections.get(`completion_${repoId}`);
-    if (ws && ws.readyState === WebSocket.OPEN) {
+  ): Promise<string> {
+    let ws = this.wsConnections.get(`completion_${repoId}`);
+    if (!ws) {
+      this.connectCompletion(repoId, () => undefined, () => undefined);
+      ws = this.wsConnections.get(`completion_${repoId}`);
+    }
+    if (!ws) throw new Error('Unable to create a completion connection');
+
+    if (ws.readyState === WebSocket.CONNECTING) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => reject(new Error('Completion connection timed out')), 8000);
+        ws!.addEventListener('open', () => { window.clearTimeout(timeout); resolve(); }, { once: true });
+        ws!.addEventListener('error', () => { window.clearTimeout(timeout); reject(new Error('Completion connection failed')); }, { once: true });
+      });
+    }
+    if (ws.readyState !== WebSocket.OPEN) {
+      throw new Error('Completion connection is closed');
+    }
+    if (this.pendingCompletion) {
+      throw new Error('Another completion request is in progress');
+    }
+
+    return new Promise<string>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        if (this.pendingCompletion) {
+          const partial = this.pendingCompletion.buffer;
+          this.pendingCompletion = null;
+          if (partial) {
+            resolve(partial);
+          } else {
+            reject(new Error('Completion timed out'));
+          }
+        }
+      }, 12000);
+
+      this.pendingCompletion = {
+        buffer: '',
+        resolve: (text) => {
+          window.clearTimeout(timeout);
+          resolve(text);
+        },
+        reject: (error) => {
+          window.clearTimeout(timeout);
+          reject(error);
+        },
+      };
+
       ws.send(
         JSON.stringify({
           prompt,
@@ -182,7 +246,7 @@ class APIClient {
           language: language || 'javascript',
         })
       );
-    }
+    });
   }
 
   // Search
