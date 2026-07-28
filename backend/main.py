@@ -1,5 +1,10 @@
 import os
 import logging
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException, WebSocketDisconnect

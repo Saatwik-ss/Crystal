@@ -1,8 +1,11 @@
 import logging
 import asyncio
 import json
-from typing import AsyncIterator, Dict, List, Any
+import re
+from typing import AsyncIterator, Dict, List, Any, Optional, Tuple
 import os
+
+from services.tool_executor import AGENT_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +62,7 @@ class AgentPlanner:
             })
             
             # Get tool schemas for function calling
-            tools = self.tool_executor.get_tool_schemas()
+            tools = self.tool_executor.get_agent_tool_schemas()
             
             # If no API key, use basic chat
             if not self.initialized:
@@ -70,13 +73,29 @@ class AgentPlanner:
                 return
             
             # Call LLM with tools
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                max_tokens=2048
-            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    max_tokens=2048,
+                    temperature=0,
+                )
+            except Exception as api_error:
+                recovered = self._recover_failed_tool_generation(str(api_error))
+                if recovered:
+                    tool_name, tool_args = recovered
+                    async for event in self._execute_recovered_tool(
+                        repo_id, tool_name, tool_args, messages
+                    ):
+                        yield event
+                    yield {"type": "end"}
+                    return
+
+                async for event in self._fallback_chat_response(messages):
+                    yield event
+                return
             
             # Process response
             assistant_message = response.choices[0].message
@@ -92,7 +111,18 @@ class AgentPlanner:
                 tool_results = []
                 for tool_call in assistant_message.tool_calls:
                     tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments)
+                    raw_arguments = tool_call.function.arguments
+                    # #region agent log
+                    from debug_log import debug_log
+                    debug_log("B", "agent_planner.py:tool_call", "received tool call", {
+                        "tool_name": tool_name,
+                        "raw_arguments": raw_arguments,
+                        "raw_arguments_type": type(raw_arguments).__name__ if raw_arguments is not None else "NoneType",
+                    })
+                    # #endregion
+                    tool_args = json.loads(raw_arguments) if raw_arguments else {}
+                    if not isinstance(tool_args, dict):
+                        tool_args = {}
                     
                     yield {
                         "type": "tool_call",
@@ -104,7 +134,7 @@ class AgentPlanner:
                     result = await self.tool_executor.execute_tool(
                         tool_name,
                         repo_id,
-                        **tool_args
+                        **(tool_args or {})
                     )
                     
                     tool_results.append({
@@ -119,9 +149,9 @@ class AgentPlanner:
                     }
                 
                 # Follow-up call with tool results
-                messages.append({"role": "assistant", "content": assistant_message.content or ""})
                 messages.append({
                     "role": "assistant",
+                    "content": assistant_message.content,
                     "tool_calls": [
                         {
                             "id": tc.id,
@@ -144,26 +174,17 @@ class AgentPlanner:
                     })
                 
                 # Stream final response
-                stream = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    stream=True,
-                    max_tokens=2048
-                )
-                
-                yield {
-                    "type": "response",
-                    "content": ""
-                }
-                
-                for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        yield {
-                            "type": "content",
-                            "content": chunk.choices[0].delta.content
-                        }
+                async for event in self._stream_final_response(messages):
+                    yield event
             else:
                 # No tool calls, just respond
+                # #region agent log
+                from debug_log import debug_log
+                debug_log("D", "agent_planner.py:no_tool_calls", "assistant responded without structured tool_calls", {
+                    "content_preview": (assistant_message.content or "")[:300],
+                    "has_function_markup": "<function" in (assistant_message.content or ""),
+                })
+                # #endregion
                 if assistant_message.content:
                     yield {
                         "type": "message",
@@ -176,10 +197,114 @@ class AgentPlanner:
             
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
+            if "tool_use_failed" in str(e):
+                async for event in self._fallback_chat_response(messages):
+                    yield event
+                return
             yield {
                 "type": "error",
                 "error": str(e)
             }
+
+    def _recover_failed_tool_generation(self, error_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Recover tool calls from Groq's failed_generation payload when present."""
+        tool_match = re.search(
+            r"<function=(\w+)\s*(\{.*?\})\s*</function>",
+            error_text,
+            re.DOTALL,
+        )
+        if not tool_match:
+            return None
+
+        tool_name, raw_args = tool_match.group(1), tool_match.group(2)
+        if tool_name not in AGENT_TOOL_NAMES:
+            return None
+
+        try:
+            return tool_name, json.loads(raw_args)
+        except json.JSONDecodeError:
+            logger.warning("Could not parse recovered tool arguments: %s", raw_args)
+            return None
+
+    async def _execute_recovered_tool(
+        self,
+        repo_id: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+    ) -> AsyncIterator[Dict[str, Any]]:
+        yield {"type": "planning", "content": "Planning actions..."}
+        yield {"type": "tool_call", "tool": tool_name, "args": tool_args}
+
+        result = await self.tool_executor.execute_tool(tool_name, repo_id, **(tool_args or {}))
+        yield {"type": "tool_result", "tool": tool_name, "result": result}
+
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "recovered_call",
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(tool_args),
+                },
+            }],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": "recovered_call",
+            "content": json.dumps(result),
+        })
+
+        async for event in self._stream_final_response(messages):
+            yield event
+
+    async def _fallback_chat_response(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Fall back to a normal chat response when tool calling fails."""
+        logger.warning("Tool calling failed; falling back to direct chat response")
+        yield {"type": "response", "content": ""}
+
+        stream = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            stream=True,
+            max_tokens=2048,
+            temperature=0.2,
+        )
+
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                yield {
+                    "type": "content",
+                    "content": chunk.choices[0].delta.content,
+                }
+
+        yield {"type": "end"}
+
+    async def _stream_final_response(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> AsyncIterator[Dict[str, Any]]:
+        yield {"type": "response", "content": ""}
+
+        stream = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            stream=True,
+            max_tokens=2048,
+            temperature=0.2,
+        )
+
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                yield {
+                    "type": "content",
+                    "content": chunk.choices[0].delta.content,
+                }
     
     def _build_agent_system_prompt(
         self,

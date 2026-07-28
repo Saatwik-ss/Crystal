@@ -6,6 +6,15 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Core tools exposed to the agent (fewer tools = more reliable tool calling)
+AGENT_TOOL_NAMES = {
+    "search_repository",
+    "read_file",
+    "list_files",
+    "ast_lookup",
+    "find_references",
+}
+
 @dataclass
 class Tool:
     name: str
@@ -166,6 +175,26 @@ class ToolExecutor:
         **kwargs
     ) -> Dict[str, Any]:
         """Execute a tool with given parameters"""
+        # #region agent log
+        from debug_log import debug_log
+        debug_log("B", "tool_executor.py:execute_tool", "executing tool", {
+            "tool_name": tool_name,
+            "repo_id": repo_id,
+            "kwargs": kwargs,
+        })
+        # #endregion
+
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+
+        if tool_name == "read_file" and "path" in kwargs and "file_path" not in kwargs:
+            kwargs["file_path"] = kwargs.pop("path")
+        if tool_name == "write_file" and "path" in kwargs and "file_path" not in kwargs:
+            kwargs["file_path"] = kwargs.pop("path")
+
+        if tool_name in self.tools:
+            allowed = set(self.tools[tool_name].parameters.keys())
+            kwargs = {key: value for key, value in kwargs.items() if key in allowed}
         
         if tool_name not in self.tools:
             return {
@@ -292,7 +321,7 @@ class ToolExecutor:
             result = subprocess.run(
                 command,
                 shell=True,
-                cwd=f"/tmp/ai_assistant_repos/{repo_id}",
+                cwd=str(self.repository_manager.upload_dir / repo_id),
                 capture_output=True,
                 text=True,
                 timeout=30
@@ -315,10 +344,20 @@ class ToolExecutor:
                 "error": str(e)
             }
     
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Get schemas for all tools (for LLM function calling)"""
+    def get_tool_schemas(self, tool_names: set[str] | None = None) -> List[Dict[str, Any]]:
+        """Get schemas for tools (for LLM function calling)"""
         schemas = []
         for tool_name, tool in self.tools.items():
+            if tool_names is not None and tool_name not in tool_names:
+                continue
+
+            properties = {}
+            required = []
+            for key, spec in tool.parameters.items():
+                properties[key] = {k: v for k, v in spec.items() if k != "default"}
+                if "default" not in spec:
+                    required.append(key)
+
             schemas.append({
                 "type": "function",
                 "function": {
@@ -326,9 +365,13 @@ class ToolExecutor:
                     "description": tool.description,
                     "parameters": {
                         "type": "object",
-                        "properties": tool.parameters,
-                        "required": list(tool.parameters.keys())
+                        "properties": properties,
+                        "required": required,
                     }
                 }
             })
         return schemas
+
+    def get_agent_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Get schemas for the curated agent tool set"""
+        return self.get_tool_schemas(AGENT_TOOL_NAMES)

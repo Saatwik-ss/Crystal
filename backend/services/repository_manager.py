@@ -1,6 +1,7 @@
 import os
 import shutil
 import asyncio
+import tempfile
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 from datetime import datetime
@@ -19,7 +20,7 @@ from .embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
-UPLOAD_DIR = Path("/tmp/ai_assistant_repos")
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(Path(tempfile.gettempdir()) / "ai_assistant_repos")))
 IGNORE_DIRS = {
     "node_modules", ".git", "dist", "build", "venv", "__pycache__",
     ".venv", ".next", ".nuxt", ".cache", ".pytest_cache", ".mypy_cache"
@@ -134,9 +135,21 @@ class RepositoryManager:
                     
                     # Generate embeddings for file chunks
                     chunks = self._chunk_file(content, file_path)
-                    for chunk_idx, chunk in enumerate(chunks):
-                        embedding = await embedding_service.embed_text(chunk)
-                        # Store in ChromaDB (see embedding_service)
+                    if chunks:
+                        await embedding_service.store_file_embeddings(
+                            repo_id,
+                            str(relative_path),
+                            chunks,
+                        )
+                    # #region agent log
+                    from debug_log import debug_log
+                    debug_log("A", "repository_manager.py:index_repository", "chunked file during indexing", {
+                        "repo_id": repo_id,
+                        "relative_path": str(relative_path),
+                        "chunk_count": len(chunks),
+                        "stored_to_chroma": bool(chunks),
+                    })
+                    # #endregion
                     
                     self.indexing_status[repo_id]["files_processed"] = idx + 1
                     

@@ -80,10 +80,8 @@ class APIClient {
     onError: (error: any) => void
   ): void {
     const key = `chat_${repoId}`;
-    const existing = this.wsConnections.get(key);
-    if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
+    this.closeConnection(key);
+
     const wsUrl = `${WS_BASE_URL}/ws/chat/${repoId}`;
     const ws = new WebSocket(wsUrl);
 
@@ -91,7 +89,6 @@ class APIClient {
       try {
         const message = JSON.parse(event.data);
         onMessage(message);
-        window.dispatchEvent(new CustomEvent('ai-chat-message', { detail: message }));
       } catch (error) {
         console.error('Failed to parse chat message:', error);
       }
@@ -103,7 +100,9 @@ class APIClient {
     };
 
     ws.onclose = () => {
-      if (this.wsConnections.get(key) === ws) this.wsConnections.delete(key);
+      if (this.wsConnections.get(key) === ws) {
+        this.wsConnections.delete(key);
+      }
     };
 
     this.wsConnections.set(key, ws);
@@ -140,10 +139,8 @@ class APIClient {
     onError: (error: any) => void
   ): void {
     const key = `completion_${repoId}`;
-    const existing = this.wsConnections.get(key);
-    if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
+    this.closeConnection(key);
+
     const wsUrl = `${WS_BASE_URL}/ws/completion/${repoId}`;
     const ws = new WebSocket(wsUrl);
 
@@ -162,7 +159,9 @@ class APIClient {
     };
 
     ws.onclose = () => {
-      if (this.wsConnections.get(key) === ws) this.wsConnections.delete(key);
+      if (this.wsConnections.get(key) === ws) {
+        this.wsConnections.delete(key);
+      }
     };
 
     this.wsConnections.set(key, ws);
@@ -209,8 +208,15 @@ class APIClient {
   // Cleanup
   closeConnections(): void {
     this.wsConnections.forEach((ws) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
+      if (
+        ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING
+      ) {
+        try {
+          ws.close();
+        } catch {
+          // ignore close errors during cleanup
+        }
       }
     });
     this.wsConnections.clear();
@@ -218,8 +224,16 @@ class APIClient {
 
   closeConnection(key: string): void {
     const ws = this.wsConnections.get(key);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.close();
+    if (
+      ws &&
+      (ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING)
+    ) {
+      try {
+        ws.close();
+      } catch {
+        // ignore close errors during cleanup
+      }
     }
     this.wsConnections.delete(key);
   }

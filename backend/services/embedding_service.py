@@ -113,6 +113,7 @@ class EmbeddingService:
         """
         try:
             collection = self.get_or_create_collection(repo_id)
+            collection_count = collection.count()
             
             # Generate query embedding
             query_embedding = await self.embed_text(query)
@@ -139,6 +140,17 @@ class EmbeddingService:
                         "content": doc,
                         "similarity": 1 - distance  # Convert distance to similarity
                     })
+            
+            # #region agent log
+            from debug_log import debug_log
+            debug_log("A", "embedding_service.py:semantic_search", "search completed", {
+                "repo_id": repo_id,
+                "query": query,
+                "collection_count": collection_count,
+                "result_count": len(formatted_results),
+                "top_file_paths": [r.get("file_path") for r in formatted_results[:3]],
+            })
+            # #endregion
             
             return formatted_results
             

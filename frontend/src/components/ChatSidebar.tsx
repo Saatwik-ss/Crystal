@@ -8,8 +8,11 @@ export default function ChatSidebar() {
   const {
     currentRepository,
     chatMessages,
+    streamingContent,
+    isStreaming,
     addChatMessage,
     clearChatMessages,
+    startChatStream,
     toggleSidebar,
     activeFile,
     selectedCode,
@@ -17,9 +20,6 @@ export default function ChatSidebar() {
 
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const [streaming, setStreaming] = useState(false);
-  const [currentStreamingMessage, setCurrentStreamingMessage] = useState('');
-  const streamingMessageRef = useRef('');
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -27,7 +27,7 @@ export default function ChatSidebar() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [chatMessages, currentStreamingMessage]);
+  }, [chatMessages, streamingContent]);
 
   const handleSendMessage = async () => {
     if (!input.trim() || !currentRepository) return;
@@ -35,7 +35,6 @@ export default function ChatSidebar() {
     const userMessage = input.trim();
     setInput('');
 
-    // Add user message
     addChatMessage({
       role: 'user',
       content: userMessage,
@@ -43,10 +42,7 @@ export default function ChatSidebar() {
       timestamp: new Date().toISOString(),
     });
 
-    // Start streaming response
-    setStreaming(true);
-    streamingMessageRef.current = '';
-    setCurrentStreamingMessage('');
+    startChatStream();
 
     try {
       await apiClient.sendChatMessage(
@@ -63,59 +59,12 @@ export default function ChatSidebar() {
         type: 'error',
         timestamp: new Date().toISOString(),
       });
-      setStreaming(false);
+      useAppStore.setState({ isStreaming: false, streamingContent: '' });
     }
   };
 
-  // Handle incoming chat messages from WebSocket
-  useEffect(() => {
-    // This should be connected in main App.tsx
-    const handleChatMessage = (message: any) => {
-      if (message.type === 'content') {
-        setCurrentStreamingMessage((prev) => prev + message.content);
-      } else if (message.type === 'message') {
-        addChatMessage({
-          role: 'assistant', content: message.content, type: 'message', timestamp: new Date().toISOString(),
-        });
-        setStreaming(false);
-      } else if (message.type === 'end') {
-        if (currentStreamingMessage) {
-          addChatMessage({
-            role: 'assistant',
-            content: currentStreamingMessage,
-            type: 'message',
-            timestamp: new Date().toISOString(),
-          });
-          setCurrentStreamingMessage('');
-        }
-        setStreaming(false);
-      } else if (message.type === 'error') {
-        addChatMessage({
-          role: 'assistant',
-          content: `Error: ${message.error}`,
-          type: 'error',
-          timestamp: new Date().toISOString(),
-        });
-        setStreaming(false);
-      } else if (message.type === 'tool_call') {
-        setCurrentStreamingMessage(
-          (prev) =>
-            prev +
-            `\n📞 Calling tool: ${message.tool}\n Args: ${JSON.stringify(
-              message.args
-            )}\n`
-        );
-      }
-    };
-
-    const listener = (event: Event) => handleChatMessage((event as CustomEvent).detail);
-    window.addEventListener('ai-chat-message', listener);
-    return () => window.removeEventListener('ai-chat-message', listener);
-  }, [currentStreamingMessage, addChatMessage]);
-
   return (
     <div className="h-full flex flex-col bg-gray-800 border-l border-gray-700">
-      {/* Header */}
       <div className="p-4 border-b border-gray-700 flex items-center justify-between">
         <div>
           <h3 className="font-semibold text-white">AI Assistant</h3>
@@ -139,9 +88,8 @@ export default function ChatSidebar() {
         </div>
       </div>
 
-      {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {chatMessages.length === 0 && !streaming && (
+        {chatMessages.length === 0 && !isStreaming && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center text-gray-400">
               <p className="text-sm">Start a conversation to analyze your code</p>
@@ -180,11 +128,11 @@ export default function ChatSidebar() {
           </div>
         ))}
 
-        {streaming && currentStreamingMessage && (
+        {isStreaming && streamingContent && (
           <div className="flex gap-3 justify-start">
             <div className="max-w-xs px-4 py-2 rounded-lg text-sm bg-gray-700 text-gray-100">
               <p className="whitespace-pre-wrap break-words">
-                {currentStreamingMessage}
+                {streamingContent}
               </p>
               <div className="flex gap-1 mt-2">
                 <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" />
@@ -198,7 +146,6 @@ export default function ChatSidebar() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input */}
       <div className="p-4 border-t border-gray-700">
         {!currentRepository && (
           <p className="text-xs text-amber-300 mb-2">Add a repository from the Explorer first, then I can answer with its code context.</p>
@@ -215,12 +162,12 @@ export default function ChatSidebar() {
               }
             }}
             placeholder="Ask about your code..."
-            disabled={streaming || !currentRepository}
+            disabled={isStreaming || !currentRepository}
             className="flex-1 bg-gray-700 text-white placeholder-gray-500 px-3 py-2 rounded border border-gray-600 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
           />
           <button
             onClick={handleSendMessage}
-            disabled={streaming || !input.trim() || !currentRepository}
+            disabled={isStreaming || !input.trim() || !currentRepository}
             className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-4 py-2 rounded transition-colors flex items-center gap-2"
           >
             <Send size={16} />
@@ -229,13 +176,13 @@ export default function ChatSidebar() {
 
         {activeFile && (
           <p className="text-xs text-gray-400 mt-2">
-            📄 Current file: {activeFile.split('/').pop()}
+            Current file: {activeFile.split('/').pop()}
           </p>
         )}
 
         {selectedCode && (
           <p className="text-xs text-gray-400 mt-1">
-            ✂️ Code selected: {selectedCode.split('\n').length} lines
+            Code selected: {selectedCode.split('\n').length} lines
           </p>
         )}
       </div>

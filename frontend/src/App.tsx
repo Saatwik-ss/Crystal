@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAppStore } from './store';
 import { apiClient } from './api/client';
+import { useRepositoryIndexing } from './hooks/useRepositoryIndexing';
 import Upload from './components/Upload';
 import Editor from './components/Editor';
 import Explorer from './components/Explorer';
@@ -10,48 +11,44 @@ import { Menu, FolderPlus, FilePlus } from 'lucide-react';
 
 export default function App() {
   const currentRepository = useAppStore((s) => s.currentRepository);
-  const indexingStatus = useAppStore((s) => s.indexingStatus);
-  const setRepositoryFiles = useAppStore((s) => s.setRepositoryFiles);
+  const handleChatWsMessage = useAppStore((s) => s.handleChatWsMessage);
   const sidebarOpen = useAppStore((s) => s.sidebarOpen);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
-  // The editor is the landing page; repository context is added from its sidebar.
   const [showUpload, setShowUpload] = useState(false);
 
-  useEffect(() => {
-    // Setup chat connection when repository is available
-    if (currentRepository) {
-      apiClient.connectChat(
-        currentRepository.id,
-        (message) => {
-          console.log('Chat message:', message);
-        },
-        (error) => {
-          console.error('Chat error:', error);
-        }
-      );
+  useRepositoryIndexing();
 
-      return () => {
-        apiClient.closeConnections();
-      };
+  useEffect(() => {
+    if (currentRepository) {
+      setShowUpload(false);
     }
   }, [currentRepository]);
 
-  // Keep completion handling alive even if the upload dialog has re-rendered.
   useEffect(() => {
-    if (!currentRepository || indexingStatus?.status !== 'completed') return;
+    if (!currentRepository) return;
 
-    let cancelled = false;
-    apiClient.listRepositoryFiles(currentRepository.id)
-      .then((files) => {
-        if (!cancelled) {
-          setRepositoryFiles(files);
-          setShowUpload(false);
-        }
-      })
-      .catch((error) => console.error('Failed to load indexed repository files:', error));
+    apiClient.connectChat(
+      currentRepository.id,
+      handleChatWsMessage,
+      (error) => {
+        console.error('Chat error:', error);
+      }
+    );
 
-    return () => { cancelled = true; };
-  }, [currentRepository, indexingStatus?.status, setRepositoryFiles]);
+    apiClient.connectCompletion(
+      currentRepository.id,
+      (message) => {
+        console.log('Completion message:', message);
+      },
+      (error) => {
+        console.error('Completion error:', error);
+      }
+    );
+
+    return () => {
+      apiClient.closeConnections();
+    };
+  }, [currentRepository, handleChatWsMessage]);
 
   return (
     <div className="flex h-screen bg-gray-900 text-gray-100">

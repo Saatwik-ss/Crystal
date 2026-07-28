@@ -148,13 +148,11 @@ class ASTService:
     def __init__(self):
         try:
             import tree_sitter_javascript
-            import tree_sitter_python
             from tree_sitter import Language, Parser
             
             self.has_tree_sitter = True
-            self.parser = Parser()
             self.js_language = Language(tree_sitter_javascript.language())
-            self.py_language = Language(tree_sitter_python.language())
+            self.js_parser = Parser(self.js_language)
         except ImportError:
             self.has_tree_sitter = False
             logger.warning("tree-sitter not available, falling back to ast module for Python only")
@@ -200,12 +198,7 @@ class ASTService:
     def _parse_javascript(self, content: str, language: str) -> Dict[str, Any]:
         """Parse JavaScript/TypeScript using tree-sitter"""
         try:
-            if language == "typescript":
-                self.parser.set_language(self.js_language)  # Tree-sitter JS handles TS
-            else:
-                self.parser.set_language(self.js_language)
-            
-            tree = self.parser.parse(content.encode('utf-8'))
+            tree = self.js_parser.parse(content.encode('utf-8'))
             
             functions = self._extract_js_functions(tree.root_node, content)
             classes = self._extract_js_classes(tree.root_node, content)

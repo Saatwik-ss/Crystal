@@ -1,31 +1,8 @@
-import { useEffect } from 'react';
 import { useAppStore } from '../store';
-import { apiClient } from '../api/client';
 import { CheckCircle, AlertCircle, Loader } from 'lucide-react';
 
 export default function IndexingStatus() {
-  const { currentRepository, indexingStatus, setIndexingStatus } = useAppStore();
-
-  useEffect(() => {
-    if (!currentRepository) return;
-
-    // Poll for indexing status
-    const interval = setInterval(async () => {
-      try {
-        const status = await apiClient.getRepositoryStatus(currentRepository.id);
-        setIndexingStatus(status);
-
-        // Stop polling when completed or failed
-        if (status.status === 'completed' || status.status === 'failed') {
-          clearInterval(interval);
-        }
-      } catch (error) {
-        console.error('Error fetching status:', error);
-      }
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, [currentRepository, setIndexingStatus]);
+  const indexingStatus = useAppStore((s) => s.indexingStatus);
 
   if (!indexingStatus) return null;
 
@@ -35,7 +12,7 @@ export default function IndexingStatus() {
 
   return (
     <div className="flex items-center gap-2">
-      {status === 'indexing' && (
+      {(status === 'initializing' || status === 'indexing') && (
         <>
           <Loader size={14} className="animate-spin text-blue-400" />
           <span className="text-xs text-gray-400">

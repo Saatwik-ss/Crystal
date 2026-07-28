@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { useAppStore } from '../store';
 import { apiClient } from '../api/client';
 import { Upload as UploadIcon, AlertCircle } from 'lucide-react';
@@ -15,9 +15,6 @@ export default function Upload({ onUploadComplete }: UploadProps) {
   const folderInputRef = useRef<HTMLInputElement>(null);
 
   const setCurrentRepository = useAppStore((s) => s.setCurrentRepository);
-  const setIndexingStatus = useAppStore((s) => s.setIndexingStatus);
-  const setRepositoryFiles = useAppStore((s) => s.setRepositoryFiles);
-  const statusIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const handleDragEnter = (e: React.DragEvent) => {
     e.preventDefault();
@@ -51,7 +48,6 @@ export default function Upload({ onUploadComplete }: UploadProps) {
           const file = entry.getAsFile();
           if (file) files.push(file);
         } else if (item?.isDirectory) {
-          // For directories, we'll collect all files recursively
           await traverseDirectory(item as FileSystemDirectoryEntry);
         }
       }
@@ -100,36 +96,7 @@ export default function Upload({ onUploadComplete }: UploadProps) {
       }
 
       setCurrentRepository(repository);
-
-      // Poll for indexing status
-      statusIntervalRef.current = setInterval(async () => {
-        try {
-          const status = await apiClient.getRepositoryStatus(repository.id);
-          setIndexingStatus(status);
-
-          if (status.status === 'completed') {
-            if (statusIntervalRef.current) {
-              clearInterval(statusIntervalRef.current);
-              statusIntervalRef.current = null;
-            }
-            const files = await apiClient.listRepositoryFiles(repository.id);
-            setRepositoryFiles(files);
-            onUploadComplete();
-          } else if (status.status === 'failed') {
-            if (statusIntervalRef.current) {
-              clearInterval(statusIntervalRef.current);
-              statusIntervalRef.current = null;
-            }
-            setError('Indexing failed: ' + (status.errors?.join(', ') || 'Unknown error'));
-          }
-        } catch (err) {
-          console.error('Error polling status:', err);
-          if (statusIntervalRef.current) {
-            clearInterval(statusIntervalRef.current);
-            statusIntervalRef.current = null;
-          }
-        }
-      }, 1000);
+      onUploadComplete();
     } catch (err) {
       const message = err instanceof Error && 'response' in err
         ? String((err as { response?: { data?: { detail?: string } } }).response?.data?.detail || err.message)
@@ -142,19 +109,9 @@ export default function Upload({ onUploadComplete }: UploadProps) {
 
   const handleFileInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
-    // Allow the user to select the same file or folder again after a failed upload.
     e.target.value = '';
     await uploadFiles(files);
   };
-
-  useEffect(() => {
-    return () => {
-      if (statusIntervalRef.current) {
-        clearInterval(statusIntervalRef.current);
-        statusIntervalRef.current = null;
-      }
-    };
-  }, []);
 
   return (
     <div className="bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 rounded-lg flex items-center justify-center p-4">
@@ -168,7 +125,6 @@ export default function Upload({ onUploadComplete }: UploadProps) {
           </p>
         </div>
 
-        {/* Drop zone */}
         <div
           onDragEnter={handleDragEnter}
           onDragLeave={handleDragLeave}
@@ -203,7 +159,6 @@ export default function Upload({ onUploadComplete }: UploadProps) {
           <input
             ref={(input) => {
               (folderInputRef as React.MutableRefObject<HTMLInputElement | null>).current = input;
-              // React's type definitions omit this Chromium folder-picker attribute.
               input?.setAttribute('webkitdirectory', '');
               input?.setAttribute('directory', '');
             }}
@@ -232,16 +187,14 @@ export default function Upload({ onUploadComplete }: UploadProps) {
           </div>
         </div>
 
-        {/* Indexing status */}
         {isUploading && (
           <div className="mt-8 p-4 bg-blue-900 bg-opacity-30 border border-blue-600 rounded-lg">
             <p className="text-blue-300 text-sm">
-              Uploading and indexing repository... This may take a moment.
+              Uploading repository... Indexing will continue in the background.
             </p>
           </div>
         )}
 
-        {/* Error message */}
         {error && (
           <div className="mt-8 p-4 bg-red-900 bg-opacity-30 border border-red-600 rounded-lg flex items-start gap-3">
             <AlertCircle size={20} className="text-red-400 mt-0.5 flex-shrink-0" />
@@ -252,27 +205,7 @@ export default function Upload({ onUploadComplete }: UploadProps) {
           </div>
         )}
 
-        {/* Info box */}
-        <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="bg-gray-800 bg-opacity-50 border border-gray-700 rounded-lg p-4">
-            <h3 className="font-semibold text-white mb-2">📂 Full Repository</h3>
-            <p className="text-gray-400 text-sm">
-              Upload your entire project for complete context understanding
-            </p>
-          </div>
-          <div className="bg-gray-800 bg-opacity-50 border border-gray-700 rounded-lg p-4">
-            <h3 className="font-semibold text-white mb-2">🔍 Automatic Indexing</h3>
-            <p className="text-gray-400 text-sm">
-              AST parsing, embeddings, and dependency graph generation
-            </p>
-          </div>
-          <div className="bg-gray-800 bg-opacity-50 border border-gray-700 rounded-lg p-4">
-            <h3 className="font-semibold text-white mb-2">💬 AI-Powered</h3>
-            <p className="text-gray-400 text-sm">
-              Get intelligent suggestions, completions, and code analysis
-            </p>
-          </div>
-        </div>
+
       </div>
     </div>
   );
