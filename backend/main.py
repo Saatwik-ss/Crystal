@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -204,7 +205,10 @@ async def websocket_completion(websocket: WebSocket, repo_id: str):
                 repo_context=repo_context,
                 language=data.get("language", "javascript")
             ):
-                await websocket.send_json(chunk)
+                if isinstance(chunk, str):
+                    await websocket.send_json(json.loads(chunk))
+                else:
+                    await websocket.send_json(chunk)
                 
     except WebSocketDisconnect:
         logger.debug("Completion client disconnected: %s", repo_id)

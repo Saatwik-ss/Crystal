@@ -61,7 +61,8 @@ class RepositoryManager:
         
         # Save uploaded files
         for file in files:
-            file_path = repo_path / file.filename
+            relative_name = file.filename.replace("\\", "/")
+            file_path = repo_path / relative_name
             file_path.parent.mkdir(parents=True, exist_ok=True)
             
             contents = await file.read()
@@ -110,7 +111,7 @@ class RepositoryManager:
             # Process each file
             for idx, file_path in enumerate(files):
                 try:
-                    relative_path = file_path.relative_to(repo_path)
+                    relative_path = file_path.relative_to(repo_path).as_posix()
                     content = file_path.read_text(encoding='utf-8', errors='ignore')
                     
                     # Determine file type and language
@@ -316,6 +317,7 @@ class RepositoryManager:
     
     async def read_file(self, repo_id: str, file_path: str) -> str:
         """Read file content from repository"""
+        file_path = file_path.replace("\\", "/")
         db = await get_db()
         repo_file = (await db.scalars(select(RepositoryFile).where(
             RepositoryFile.repository_id == repo_id,
