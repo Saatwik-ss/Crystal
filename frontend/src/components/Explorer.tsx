@@ -27,6 +27,7 @@ export default function Explorer() {
     setActiveFile,
     openFiles,
     activeFile,
+    localFiles,
   } = useAppStore();
 
   const [loadingPath, setLoadingPath] = useState<string | null>(null);
@@ -60,7 +61,15 @@ export default function Explorer() {
     setFileTree(tree);
   }, [repositoryFiles]);
 
-  const handleFileClick = async (filePath: string) => {
+  const handleLocalFileClick = (path: string) => {
+    const file = localFiles.find((f) => f.path === path) || openFiles.get(path);
+    if (file) {
+      openFile(file);
+      setError(null);
+    }
+  };
+
+  const handleRepoFileClick = async (filePath: string) => {
     const normalizedPath = normalizePath(filePath);
 
     if (!currentRepository?.id) {
@@ -130,6 +139,12 @@ export default function Explorer() {
     return filterTree(fileTree);
   }, [fileTree, searchTerm]);
 
+  const filteredLocalFiles = useMemo(() => {
+    if (!searchTerm) return localFiles;
+    const q = searchTerm.toLowerCase();
+    return localFiles.filter((f) => f.path.toLowerCase().includes(q));
+  }, [localFiles, searchTerm]);
+
   const renderTree = (tree: FileTree, prefix = '') => {
     return Object.entries(tree)
       .sort(([aKey, aVal], [bKey, bVal]) => {
@@ -153,7 +168,7 @@ export default function Explorer() {
               }`}
               onClick={() => {
                 if (isFile) {
-                  handleFileClick(fullPath);
+                  handleRepoFileClick(fullPath);
                 } else {
                   toggleFolder(fullPath);
                 }
@@ -203,15 +218,42 @@ export default function Explorer() {
       )}
 
       <div className="flex-1 overflow-y-auto">
-        {repositoryFiles.length === 0 ? (
+        {filteredLocalFiles.length > 0 && (
+          <div className="py-2 border-b border-gray-700">
+            <p className="px-3 py-1 text-[10px] uppercase tracking-wide text-gray-500">
+              Local files
+            </p>
+            {filteredLocalFiles.map((file) => (
+              <div
+                key={file.path}
+                className={`flex items-center gap-1 px-2 py-1 cursor-pointer text-sm ${
+                  activeFile === file.path
+                    ? 'bg-gray-700 text-white'
+                    : 'text-gray-300 hover:bg-gray-700'
+                }`}
+                onClick={() => handleLocalFileClick(file.path)}
+              >
+                <File size={14} className="text-emerald-400" />
+                <span className="flex-1 truncate">{file.path}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {repositoryFiles.length === 0 && localFiles.length === 0 ? (
           <div className="flex items-center justify-center h-full p-4 text-center">
             <p className="text-gray-400 text-sm">
-              {currentRepository ? 'Indexing files...' : 'Upload a repository to browse files'}
+              Create a new file or upload a folder to get started
             </p>
           </div>
-        ) : (
-          <div className="py-2">{renderTree(filteredTree)}</div>
-        )}
+        ) : repositoryFiles.length > 0 ? (
+          <div className="py-2">
+            <p className="px-3 py-1 text-[10px] uppercase tracking-wide text-gray-500">
+              Repository
+            </p>
+            {renderTree(filteredTree)}
+          </div>
+        ) : null}
       </div>
     </div>
   );

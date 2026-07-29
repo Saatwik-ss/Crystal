@@ -10,6 +10,13 @@ import type {
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const WS_BASE_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
 
+/** Session id used when no repository is uploaded */
+export const LOCAL_SESSION_ID = 'local';
+
+function sessionId(repoId?: string | null): string {
+  return repoId && repoId !== LOCAL_SESSION_ID ? repoId : LOCAL_SESSION_ID;
+}
+
 class APIClient {
   private client: AxiosInstance;
   private wsConnections: Map<string, WebSocket> = new Map();
@@ -81,14 +88,15 @@ class APIClient {
 
   // Chat WebSocket
   connectChat(
-    repoId: string,
+    repoId: string | null | undefined,
     onMessage: (message: any) => void,
     onError: (error: any) => void
   ): void {
-    const key = `chat_${repoId}`;
+    const id = sessionId(repoId);
+    const key = `chat_${id}`;
     this.closeConnection(key);
 
-    const wsUrl = `${WS_BASE_URL}/ws/chat/${repoId}`;
+    const wsUrl = `${WS_BASE_URL}/ws/chat/${id}`;
     const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {
@@ -115,15 +123,16 @@ class APIClient {
   }
 
   async sendChatMessage(
-    repoId: string,
+    repoId: string | null | undefined,
     message: string,
     selectedFile?: string,
     selectedCode?: string
   ): Promise<void> {
-    let ws = this.wsConnections.get(`chat_${repoId}`);
+    const id = sessionId(repoId);
+    let ws = this.wsConnections.get(`chat_${id}`);
     if (!ws) {
-      this.connectChat(repoId, () => undefined, () => undefined);
-      ws = this.wsConnections.get(`chat_${repoId}`);
+      this.connectChat(id, () => undefined, () => undefined);
+      ws = this.wsConnections.get(`chat_${id}`);
     }
     if (!ws) throw new Error('Unable to create a chat connection');
 
@@ -140,14 +149,15 @@ class APIClient {
 
   // Completion WebSocket
   connectCompletion(
-    repoId: string,
+    repoId: string | null | undefined,
     onMessage: (message: any) => void,
     onError: (error: any) => void
   ): void {
-    const key = `completion_${repoId}`;
+    const id = sessionId(repoId);
+    const key = `completion_${id}`;
     this.closeConnection(key);
 
-    const wsUrl = `${WS_BASE_URL}/ws/completion/${repoId}`;
+    const wsUrl = `${WS_BASE_URL}/ws/completion/${id}`;
     const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {
@@ -188,15 +198,16 @@ class APIClient {
   }
 
   async requestCompletion(
-    repoId: string,
+    repoId: string | null | undefined,
     prompt: string,
     filePath?: string,
     language?: string
   ): Promise<string> {
-    let ws = this.wsConnections.get(`completion_${repoId}`);
+    const id = sessionId(repoId);
+    let ws = this.wsConnections.get(`completion_${id}`);
     if (!ws) {
-      this.connectCompletion(repoId, () => undefined, () => undefined);
-      ws = this.wsConnections.get(`completion_${repoId}`);
+      this.connectCompletion(id, () => undefined, () => undefined);
+      ws = this.wsConnections.get(`completion_${id}`);
     }
     if (!ws) throw new Error('Unable to create a completion connection');
 
@@ -239,7 +250,7 @@ class APIClient {
         },
       };
 
-      ws.send(
+      ws!.send(
         JSON.stringify({
           prompt,
           file_path: filePath,

@@ -208,7 +208,7 @@ class CodeCompletionService:
     ) -> AsyncIterator[str]:
         """Complete a code block (if/for/class/function body)"""
         
-        prompt = f"Complete the {language} code block:\n\n{block_start}\n\nProvide the complete block."
+        prompt = f"Complete the {language} code block:\n\n{block_start}\n\nProvide the complete block., do not change the complete code unless necessary, only provide the code after code block:\n\n{block_start}, if a full change is needed to be given, return the full code block in a new line"
         
         if context:
             prompt = f"Context:\n{context}\n\n" + prompt

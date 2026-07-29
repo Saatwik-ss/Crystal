@@ -4,16 +4,20 @@ import EditorTabs from './EditorTabs';
 import MonacoEditor from '@monaco-editor/react';
 import type { OnMount } from '@monaco-editor/react';
 import type * as Monaco from 'monaco-editor';
-import { apiClient } from '../api/client';
+import { apiClient, LOCAL_SESSION_ID } from '../api/client';
 import { getMonacoLanguage } from '../utils/language';
 
 const COMPLETION_LANGUAGES = [
-  'python', 'javascript', 'typescript', 'json', 'html', 'css', 'java', 'go', 'rust', 'ruby', 'php', 'c', 'cpp', 'csharp', 'shell', 'markdown', 'yaml', 'xml', 'plaintext',
+  'python', 'javascript', 'typescript', 'json', 'html', 'css', 'java', 'go', 'rust', 'ruby', 'php', 'c', 'cpp', 'csharp', 'shell', 'markdown', 'yaml', 'xml', 'plaintext', 'sql',
 ];
 
 let completionRequestId = 0;
 
-export default function Editor() {
+interface EditorProps {
+  onRequestNewFile?: () => void;
+}
+
+export default function Editor({ onRequestNewFile }: EditorProps) {
   const {
     openFiles,
     activeFile,
@@ -27,6 +31,7 @@ export default function Editor() {
   const inlineProviderRef = useRef<Monaco.IDisposable | null>(null);
 
   const currentFile = activeFile ? openFiles.get(activeFile) : null;
+  const sessionId = currentRepository?.id || LOCAL_SESSION_ID;
 
   const handleEditorChange = (value: string | undefined) => {
     if (value !== undefined && activeFile) {
@@ -40,8 +45,6 @@ export default function Editor() {
     filePath: string,
     language: string,
   ) => {
-    if (!currentRepository?.id) return null;
-
     const prefix = model.getValueInRange({
       startLineNumber: Math.max(1, position.lineNumber - 30),
       startColumn: 1,
@@ -54,7 +57,7 @@ export default function Editor() {
     const requestId = ++completionRequestId;
     try {
       const text = await apiClient.requestCompletion(
-        currentRepository.id,
+        sessionId,
         prefix,
         filePath,
         language,
@@ -69,7 +72,7 @@ export default function Editor() {
       console.error('LLM completion failed:', error);
       return null;
     }
-  }, [currentRepository?.id]);
+  }, [sessionId]);
 
   const registerCompletionProviders = useCallback((
     monaco: typeof Monaco,
@@ -82,10 +85,6 @@ export default function Editor() {
     completionProviderRef.current = monaco.languages.registerCompletionItemProvider(language, {
       triggerCharacters: ['.', '(', '[', '{', ':', ' ', '\n', '"', "'"],
       provideCompletionItems: async (model, position) => {
-        if (!currentRepository?.id) {
-          return { suggestions: [] };
-        }
-
         const completionText = await requestLlmCompletion(model, position, filePath, language);
         if (!completionText) {
           return { suggestions: [] };
@@ -115,7 +114,7 @@ export default function Editor() {
     if (monaco.languages.registerInlineCompletionsProvider) {
       inlineProviderRef.current = monaco.languages.registerInlineCompletionsProvider(language, {
         provideInlineCompletions: async (model, position, _context, token) => {
-          if (!currentRepository?.id || token.isCancellationRequested) {
+          if (token.isCancellationRequested) {
             return { items: [] };
           }
 
@@ -139,14 +138,14 @@ export default function Editor() {
         freeInlineCompletions: () => {},
       });
     }
-  }, [currentRepository?.id, requestLlmCompletion]);
+  }, [requestLlmCompletion]);
 
   const handleEditorMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
     monacoRef.current = monaco;
 
     if (currentFile) {
-      const language = getMonacoLanguage(currentFile.path);
+      const language = currentFile.language || getMonacoLanguage(currentFile.path);
       registerCompletionProviders(monaco, currentFile.path, language);
     }
   };
@@ -157,7 +156,9 @@ export default function Editor() {
     });
   };
 
-  const language = currentFile ? getMonacoLanguage(currentFile.path) : 'plaintext';
+  const language = currentFile
+    ? (currentFile.language || getMonacoLanguage(currentFile.path))
+    : 'plaintext';
 
   return (
     <div className="h-full flex flex-col bg-gray-900">
@@ -201,8 +202,19 @@ export default function Editor() {
             }}
           />
         ) : (
-          <div className="h-full flex items-center justify-center text-gray-500 text-sm">
-            Select a file from the Explorer to start editing
+          <div className="h-full flex flex-col items-center justify-center text-gray-400 gap-3 px-6 text-center">
+            <p className="text-sm">No file open</p>
+            <p className="text-xs text-gray-500 max-w-sm">
+              Create a new file to start coding with AI completions, or upload a folder for repo context.
+            </p>
+            {onRequestNewFile && (
+              <button
+                onClick={onRequestNewFile}
+                className="mt-2 px-4 py-2 rounded bg-blue-600 hover:bg-blue-700 text-white text-sm"
+              >
+                New file
+              </button>
+            )}
           </div>
         )}
       </div>

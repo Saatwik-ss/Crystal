@@ -158,8 +158,14 @@ async def websocket_chat(websocket: WebSocket, repo_id: str):
         while True:
             data = await websocket.receive_json()
             
-            # Get repository context
-            repo_context = await repository_manager.get_repository_context(repo_id)
+            # Local session (no uploaded repo) gets empty context
+            if repo_id in ("local", "none", "__none__"):
+                repo_context = {"files": [], "total_files": 0, "languages": []}
+            else:
+                try:
+                    repo_context = await repository_manager.get_repository_context(repo_id)
+                except Exception:
+                    repo_context = {"files": [], "total_files": 0, "languages": []}
             
             # Process chat with agent
             async for chunk in agent_planner.process_user_request(
@@ -195,8 +201,13 @@ async def websocket_completion(websocket: WebSocket, repo_id: str):
         while True:
             data = await websocket.receive_json()
             
-            # Get repository context for better completions
-            repo_context = await repository_manager.get_repository_context(repo_id)
+            if repo_id in ("local", "none", "__none__"):
+                repo_context = {"files": [], "total_files": 0, "languages": []}
+            else:
+                try:
+                    repo_context = await repository_manager.get_repository_context(repo_id)
+                except Exception:
+                    repo_context = {"files": [], "total_files": 0, "languages": []}
             
             # Stream completion
             async for chunk in code_completion_service.stream_completion(

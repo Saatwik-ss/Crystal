@@ -61,8 +61,10 @@ class AgentPlanner:
                 "content": message
             })
             
-            # Get tool schemas for function calling
-            tools = self.tool_executor.get_agent_tool_schemas()
+            # Local / no-repo sessions: answer directly without tools
+            has_repo = repo_id not in ("local", "none", "__none__", None, "")
+            has_indexed_files = bool((context or {}).get("total_files"))
+            use_tools = has_repo and has_indexed_files
             
             # If no API key, use basic chat
             if not self.initialized:
@@ -71,6 +73,15 @@ class AgentPlanner:
                     "content": "Mock response. Configure GROQ_API_KEY for full agent capabilities."
                 }
                 return
+
+            if not use_tools:
+                async for event in self._stream_final_response(messages):
+                    yield event
+                yield {"type": "end"}
+                return
+            
+            # Get tool schemas for function calling
+            tools = self.tool_executor.get_agent_tool_schemas()
             
             # Call LLM with tools
             try:
@@ -314,7 +325,9 @@ class AgentPlanner:
     ) -> str:
         """Build system prompt for agent with context"""
         
-        prompt = """You are an expert AI coding agent. Your job is to:
+        has_repo_files = bool((repository_context or {}).get("total_files"))
+        if has_repo_files:
+            prompt = """You are an expert AI coding agent. Your job is to:
 1. Understand user requests related to code
 2. Use tools to gather information about the repository
 3. Make decisions about what tools to call
@@ -339,6 +352,12 @@ When you need to take action:
 2. Plan your approach
 3. Execute specific tool calls
 4. Report results to the user
+"""
+        else:
+            prompt = """You are an expert AI coding assistant.
+Help the user with coding questions, explanations, and writing code.
+No repository is indexed right now — answer from general knowledge and any selected file/code the user shares.
+Respond clearly. When writing code, prefer complete, ready-to-paste snippets without unnecessary markdown fences unless helpful.
 """
         
         if repository_context:

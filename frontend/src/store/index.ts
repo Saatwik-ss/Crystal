@@ -27,6 +27,9 @@ interface AppStore {
   setActiveFile: (path: string) => void;
   updateFileContent: (path: string, content: string) => void;
   setSelectedCode: (code: string | null) => void;
+  createLocalFile: (file: FileContent) => void;
+  localFiles: FileContent[];
+  removeLocalFile: (path: string) => void;
 
   // Chat state
   chatMessages: ChatMessage[];
@@ -77,7 +80,8 @@ export const useAppStore = create<AppStore>((set) => ({
   openFiles: new Map(),
   activeFile: null,
   selectedCode: null,
-  
+  localFiles: [],
+
   openFile: (file) =>
     set((state) => {
       const newOpenFiles = new Map(state.openFiles);
@@ -85,6 +89,37 @@ export const useAppStore = create<AppStore>((set) => ({
       return {
         openFiles: newOpenFiles,
         activeFile: file.path,
+      };
+    }),
+
+  createLocalFile: (file) =>
+    set((state) => {
+      const newOpenFiles = new Map(state.openFiles);
+      newOpenFiles.set(file.path, file);
+      const exists = state.localFiles.some((f) => f.path === file.path);
+      return {
+        openFiles: newOpenFiles,
+        activeFile: file.path,
+        localFiles: exists
+          ? state.localFiles.map((f) => (f.path === file.path ? file : f))
+          : [...state.localFiles, file],
+      };
+    }),
+
+  removeLocalFile: (path) =>
+    set((state) => {
+      const newOpenFiles = new Map(state.openFiles);
+      newOpenFiles.delete(path);
+      const remaining = Array.from(newOpenFiles.keys());
+      return {
+        localFiles: state.localFiles.filter((f) => f.path !== path),
+        openFiles: newOpenFiles,
+        activeFile:
+          state.activeFile === path
+            ? remaining.length > 0
+              ? remaining[remaining.length - 1]
+              : null
+            : state.activeFile,
       };
     }),
 
@@ -108,7 +143,12 @@ export const useAppStore = create<AppStore>((set) => ({
       if (file) {
         newOpenFiles.set(path, { ...file, content });
       }
-      return { openFiles: newOpenFiles };
+      return {
+        openFiles: newOpenFiles,
+        localFiles: state.localFiles.map((f) =>
+          f.path === path ? { ...f, content } : f
+        ),
+      };
     }),
 
   setSelectedCode: (code) => set({ selectedCode: code }),

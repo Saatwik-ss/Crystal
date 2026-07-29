@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react';
 import { useAppStore } from './store';
-import { apiClient } from './api/client';
+import { apiClient, LOCAL_SESSION_ID } from './api/client';
 import { useRepositoryIndexing } from './hooks/useRepositoryIndexing';
 import Upload from './components/Upload';
 import Editor from './components/Editor';
 import Explorer from './components/Explorer';
 import ChatSidebar from './components/ChatSidebar';
 import IndexingStatus from './components/IndexingStatus';
+import NewFileDialog from './components/NewFileDialog';
 import { Menu, FolderPlus, FilePlus } from 'lucide-react';
 
 export default function App() {
@@ -15,6 +16,7 @@ export default function App() {
   const sidebarOpen = useAppStore((s) => s.sidebarOpen);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   const [showUpload, setShowUpload] = useState(false);
+  const [showNewFile, setShowNewFile] = useState(false);
 
   useRepositoryIndexing();
 
@@ -24,11 +26,12 @@ export default function App() {
     }
   }, [currentRepository]);
 
+  // Always keep chat + completion sockets open (local session if no repo)
   useEffect(() => {
-    if (!currentRepository) return;
+    const sessionId = currentRepository?.id || LOCAL_SESSION_ID;
 
     apiClient.connectChat(
-      currentRepository.id,
+      sessionId,
       handleChatWsMessage,
       (error) => {
         console.error('Chat error:', error);
@@ -36,7 +39,7 @@ export default function App() {
     );
 
     apiClient.connectCompletion(
-      currentRepository.id,
+      sessionId,
       () => undefined,
       (error) => {
         console.error('Completion error:', error);
@@ -55,8 +58,20 @@ export default function App() {
         <div className="p-4 border-b border-gray-700 flex items-center justify-between">
           <h2 className="font-semibold text-sm">Explorer</h2>
           <div className="flex gap-1">
-            <button onClick={() => setShowUpload(true)} className="p-1 text-gray-300 hover:bg-gray-700 rounded" title="Add repository files or folders"><FolderPlus size={16} /></button>
-            <button onClick={() => setShowUpload(true)} className="p-1 text-gray-300 hover:bg-gray-700 rounded" title="Add file context"><FilePlus size={16} /></button>
+            <button
+              onClick={() => setShowNewFile(true)}
+              className="p-1 text-gray-300 hover:bg-gray-700 rounded"
+              title="New file"
+            >
+              <FilePlus size={16} />
+            </button>
+            <button
+              onClick={() => setShowUpload(true)}
+              className="p-1 text-gray-300 hover:bg-gray-700 rounded"
+              title="Add repository files or folders"
+            >
+              <FolderPlus size={16} />
+            </button>
           </div>
         </div>
         <Explorer />
@@ -64,29 +79,27 @@ export default function App() {
 
       {/* Editor Area */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Top status bar */}
         <div className="bg-gray-800 border-b border-gray-700 px-4 py-2 flex items-center justify-between text-xs">
           <div className="flex items-center gap-2">
-            <span className="text-gray-400">Repository:</span>
-            <span className="font-mono">{currentRepository?.name || 'No repository loaded'}</span>
+            <span className="text-gray-400">Workspace:</span>
+            <span className="font-mono">
+              {currentRepository?.name || 'Local (no repository)'}
+            </span>
           </div>
           <IndexingStatus />
         </div>
 
-        {/* Main editor */}
         <div className="flex-1 overflow-hidden">
-          <Editor />
+          <Editor onRequestNewFile={() => setShowNewFile(true)} />
         </div>
       </div>
 
-      {/* Right Sidebar - Chat */}
       {sidebarOpen && (
         <div className="w-96 bg-gray-800 border-l border-gray-700 flex flex-col overflow-hidden">
           <ChatSidebar />
         </div>
       )}
 
-      {/* Toggle sidebar button */}
       {!sidebarOpen && (
         <button
           onClick={toggleSidebar}
@@ -97,12 +110,20 @@ export default function App() {
         </button>
       )}
 
-      {/* Upload dialog */}
       {showUpload && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-gray-800 rounded-lg p-6 max-w-2xl w-full mx-4 max-h-[90vh] overflow-y-auto">
-            <h2 className="text-xl font-bold mb-4">Add repository context</h2>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-bold">Add repository context</h2>
+              <button
+                onClick={() => setShowUpload(false)}
+                className="text-gray-400 hover:text-white text-sm"
+              >
+                Close
+              </button>
+            </div>
             <Upload
+              compact
               onUploadComplete={() => {
                 setShowUpload(false);
               }}
@@ -110,6 +131,8 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {showNewFile && <NewFileDialog onClose={() => setShowNewFile(false)} />}
     </div>
   );
 }

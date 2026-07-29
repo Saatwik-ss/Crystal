@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { useAppStore } from '../store';
-import { apiClient } from '../api/client';
+import { apiClient, LOCAL_SESSION_ID } from '../api/client';
 import { Send, Trash2, X } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -16,6 +16,7 @@ export default function ChatSidebar() {
     toggleSidebar,
     activeFile,
     selectedCode,
+    openFiles,
   } = useAppStore();
 
   const [input, setInput] = useState('');
@@ -30,7 +31,7 @@ export default function ChatSidebar() {
   }, [chatMessages, streamingContent]);
 
   const handleSendMessage = async () => {
-    if (!input.trim() || !currentRepository) return;
+    if (!input.trim() || isStreaming) return;
 
     const userMessage = input.trim();
     setInput('');
@@ -44,12 +45,17 @@ export default function ChatSidebar() {
 
     startChatStream();
 
+    const activeContent = activeFile ? openFiles.get(activeFile)?.content : undefined;
+    const codeContext =
+      selectedCode ||
+      (activeContent ? activeContent.slice(0, 4000) : undefined);
+
     try {
       await apiClient.sendChatMessage(
-        currentRepository.id,
+        currentRepository?.id || LOCAL_SESSION_ID,
         userMessage,
         activeFile || undefined,
-        selectedCode || undefined
+        codeContext
       );
     } catch (error) {
       console.error('Failed to send message:', error);
@@ -68,7 +74,9 @@ export default function ChatSidebar() {
       <div className="p-4 border-b border-gray-700 flex items-center justify-between">
         <div>
           <h3 className="font-semibold text-white">AI Assistant</h3>
-          <p className="text-xs text-gray-400 mt-1">Chat with your codebase</p>
+          <p className="text-xs text-gray-400 mt-1">
+            {currentRepository ? 'Chat with your codebase' : 'General coding chat'}
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -92,9 +100,9 @@ export default function ChatSidebar() {
         {chatMessages.length === 0 && !isStreaming && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center text-gray-400">
-              <p className="text-sm">Start a conversation to analyze your code</p>
+              <p className="text-sm">Ask anything about code</p>
               <p className="text-xs mt-2 text-gray-500">
-                The AI will use repository context and selected code
+                Upload a folder for codebase-aware answers.
               </p>
             </div>
           </div>
@@ -147,27 +155,24 @@ export default function ChatSidebar() {
       </div>
 
       <div className="p-4 border-t border-gray-700">
-        {!currentRepository && (
-          <p className="text-xs text-amber-300 mb-2">Add a repository from the Explorer first, then I can answer with its code context.</p>
-        )}
         <div className="flex gap-2">
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyPress={(e) => {
+            onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 handleSendMessage();
               }
             }}
             placeholder="Ask about your code..."
-            disabled={isStreaming || !currentRepository}
+            disabled={isStreaming}
             className="flex-1 bg-gray-700 text-white placeholder-gray-500 px-3 py-2 rounded border border-gray-600 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
           />
           <button
             onClick={handleSendMessage}
-            disabled={isStreaming || !input.trim() || !currentRepository}
+            disabled={isStreaming || !input.trim()}
             className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-4 py-2 rounded transition-colors flex items-center gap-2"
           >
             <Send size={16} />
