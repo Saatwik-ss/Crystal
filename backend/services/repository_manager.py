@@ -17,6 +17,7 @@ from database.db import get_db
 from database.models import Repository, RepositoryFile, IndexingStatus
 from .ast_service import ASTService
 from .embedding_service import EmbeddingService
+from .chunking_service import ChunkingService
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,10 @@ class RepositoryManager:
             db = await get_db()
             ast_service = ASTService()
             embedding_service = EmbeddingService()
+            chunking_service = ChunkingService(ast_service)
+
+            # Clear previous embeddings so reindex does not duplicate
+            embedding_service.reset_collection(repo_id)
             
             # Process each file
             for idx, file_path in enumerate(files):
@@ -134,22 +139,30 @@ class RepositoryManager:
                     )
                     db.add(repo_file)
                     
-                    # Generate embeddings for file chunks
-                    chunks = self._chunk_file(content, file_path)
+                    # AST-based (or fallback) symbol chunks → Chroma
+                    chunks = chunking_service.chunk_file(
+                        content,
+                        str(relative_path),
+                        language,
+                        ast_data,
+                    )
                     if chunks:
-                        await embedding_service.store_file_embeddings(
+                        await embedding_service.store_symbol_embeddings(
                             repo_id,
-                            str(relative_path),
                             chunks,
                         )
                     # #region agent log
-                    from debug_log import debug_log
-                    debug_log("A", "repository_manager.py:index_repository", "chunked file during indexing", {
-                        "repo_id": repo_id,
-                        "relative_path": str(relative_path),
-                        "chunk_count": len(chunks),
-                        "stored_to_chroma": bool(chunks),
-                    })
+                    try:
+                        from debug_log import debug_log
+                        debug_log("A", "repository_manager.py:index_repository", "chunked file during indexing", {
+                            "repo_id": repo_id,
+                            "relative_path": str(relative_path),
+                            "chunk_count": len(chunks),
+                            "stored_to_chroma": bool(chunks),
+                            "symbol_types": list({c.get("symbol_type") for c in chunks}) if chunks else [],
+                        })
+                    except Exception:
+                        pass
                     # #endregion
                     
                     self.indexing_status[repo_id]["files_processed"] = idx + 1

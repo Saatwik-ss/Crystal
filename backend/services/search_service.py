@@ -45,7 +45,7 @@ class SearchService:
         query: str,
         top_k: int = 5
     ) -> List[Dict[str, Any]]:
-        """Semantic search using embeddings"""
+        """Semantic search using AST-symbol embeddings (with neighbor context)."""
         try:
             results = await self.embedding_service.semantic_search(
                 repo_id, query, top_k
