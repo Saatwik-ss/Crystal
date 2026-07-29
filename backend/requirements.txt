@@ -3,8 +3,7 @@ uvicorn[standard]==0.24.0
 
 sqlalchemy[asyncio]==2.0.23
 aiosqlite==0.19.0
-psycopg[binary]==3.1.13
-
+psycopg[binary]==3.2.9
 pydantic==2.5.0
 pydantic-settings==2.1.0
 
