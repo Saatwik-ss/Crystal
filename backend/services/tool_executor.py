@@ -13,6 +13,7 @@ AGENT_TOOL_NAMES = {
     "list_files",
     "ast_lookup",
     "find_references",
+    "propose_edit",
 }
 
 @dataclass
@@ -77,7 +78,7 @@ class ToolExecutor:
             self._read_file
         )
         
-        # Write file
+        # Write file (registered but not in AGENT_TOOL_NAMES — apply goes through HTTP)
         self.register_tool(
             "write_file",
             "Write content to file",
@@ -86,6 +87,22 @@ class ToolExecutor:
                 "content": {"type": "string", "description": "File content"}
             },
             self._write_file
+        )
+
+        # Propose edit (staged; does not write disk)
+        self.register_tool(
+            "propose_edit",
+            "Propose a complete file replacement. Pass the FULL new file content. Does not write until the user applies the diff.",
+            {
+                "file_path": {"type": "string", "description": "Path to file to edit"},
+                "new_content": {"type": "string", "description": "Complete new file content"},
+                "rationale": {
+                    "type": "string",
+                    "description": "Brief reason for the change",
+                    "default": "",
+                },
+            },
+            self._propose_edit,
         )
         
         # List files
@@ -191,6 +208,10 @@ class ToolExecutor:
             kwargs["file_path"] = kwargs.pop("path")
         if tool_name == "write_file" and "path" in kwargs and "file_path" not in kwargs:
             kwargs["file_path"] = kwargs.pop("path")
+        if tool_name == "propose_edit" and "path" in kwargs and "file_path" not in kwargs:
+            kwargs["file_path"] = kwargs.pop("path")
+        if tool_name == "propose_edit" and "content" in kwargs and "new_content" not in kwargs:
+            kwargs["new_content"] = kwargs.pop("content")
 
         if tool_name in self.tools:
             allowed = set(self.tools[tool_name].parameters.keys())
@@ -251,6 +272,121 @@ class ToolExecutor:
     ) -> Dict[str, Any]:
         """Write file"""
         return await self.repository_manager.write_file(repo_id, file_path, content)
+
+    def _detect_language(self, file_path: str) -> str:
+        lower = file_path.lower()
+        if lower.endswith(".py"):
+            return "python"
+        if lower.endswith((".ts", ".tsx")):
+            return "typescript"
+        if lower.endswith((".js", ".jsx")):
+            return "javascript"
+        return "unknown"
+
+    def _validate_proposed_content(
+        self,
+        file_path: str,
+        original: str,
+        proposed: str,
+    ) -> Dict[str, Any]:
+        """Syntax/AST validation for proposed file content."""
+        language = self._detect_language(file_path)
+        errors: List[str] = []
+
+        if language == "python":
+            try:
+                compile(proposed, file_path, "exec")
+            except SyntaxError as e:
+                errors.append(f"Python syntax error: {e.msg} (line {e.lineno})")
+            if self.ast_service:
+                parsed = self.ast_service.parse_file(proposed, "python")
+                if parsed is None and original.strip():
+                    # Original may also fail; only fail if proposed is unparsable
+                    try:
+                        compile(proposed, file_path, "exec")
+                    except SyntaxError:
+                        pass  # already recorded
+                    else:
+                        # compile ok but parse_file failed — still ok
+                        pass
+            return {
+                "ok": len(errors) == 0,
+                "errors": errors,
+                "language": language,
+                "skipped": False,
+            }
+
+        if language in ("javascript", "typescript"):
+            if self.ast_service and self.ast_service.has_tree_sitter:
+                parsed = self.ast_service.parse_file(proposed, language)
+                # tree-sitter usually returns a tree even for broken code;
+                # treat empty/None as failure
+                if parsed is None:
+                    errors.append(f"{language} parse failed")
+                return {
+                    "ok": len(errors) == 0,
+                    "errors": errors,
+                    "language": language,
+                    "skipped": False,
+                }
+            return {
+                "ok": True,
+                "errors": [],
+                "language": language,
+                "skipped": True,
+            }
+
+        return {
+            "ok": True,
+            "errors": [],
+            "language": language,
+            "skipped": True,
+        }
+
+    async def _propose_edit(
+        self,
+        repo_id: str,
+        file_path: str,
+        new_content: str,
+        rationale: str = "",
+    ) -> Dict[str, Any]:
+        """Propose a full-file edit without writing to disk."""
+        import difflib
+
+        file_path = (file_path or "").replace("\\", "/")
+        original = ""
+        try:
+            original = await self.repository_manager.read_file(repo_id, file_path)
+        except FileNotFoundError:
+            original = ""
+        except Exception:
+            # Local / missing repo — treat as new or empty
+            original = ""
+
+        proposed = new_content if new_content is not None else ""
+        validation = self._validate_proposed_content(file_path, original, proposed)
+
+        diff_lines = list(
+            difflib.unified_diff(
+                original.splitlines(keepends=True),
+                proposed.splitlines(keepends=True),
+                fromfile=f"a/{file_path}",
+                tofile=f"b/{file_path}",
+                lineterm="",
+            )
+        )
+        # unified_diff with lineterm="" still needs newlines between lines for display
+        diff_text = "\n".join(line.rstrip("\n") for line in diff_lines)
+
+        return {
+            "file_path": file_path,
+            "original": original,
+            "proposed": proposed,
+            "diff": diff_text,
+            "rationale": rationale or "",
+            "validation": validation,
+            "is_new_file": original == "" and proposed != "",
+        }
     
     async def _list_files(self, repo_id: str) -> List[Dict[str, Any]]:
         """List files"""

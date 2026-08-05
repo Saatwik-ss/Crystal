@@ -70,6 +70,33 @@ export interface Diff {
   lines: DiffLine[];
 }
 
+export interface EditValidation {
+  ok: boolean;
+  errors: string[];
+  language?: string;
+  skipped?: boolean;
+}
+
+export interface ProposedEdit {
+  file_path: string;
+  original: string;
+  proposed: string;
+  diff: string;
+  rationale?: string;
+  validation: EditValidation;
+  is_new_file?: boolean;
+}
+
+export interface EditProposal {
+  request_id: string;
+  edits: ProposedEdit[];
+}
+
+export interface AppliedEditSnapshot {
+  request_id: string;
+  edits: ProposedEdit[];
+}
+
 export interface ContextWindow {
   currentFile?: string;
   selectedCode?: string;

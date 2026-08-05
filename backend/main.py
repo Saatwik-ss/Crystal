@@ -13,7 +13,7 @@ from starlette.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import asyncio
-from typing import Optional
+from typing import Optional, List
 
 from services.repository_manager import RepositoryManager
 from services.embedding_service import EmbeddingService
@@ -23,8 +23,10 @@ from services.chat_service import ChatService
 from services.code_completion_service import CodeCompletionService
 from services.tool_executor import ToolExecutor
 from services.agent_planner import AgentPlanner
+from services.edit_history import EditHistory
 from database.db import init_db, get_db
 from api import repository_routes, chat_routes, search_routes, completion_routes
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,12 +40,27 @@ chat_service: Optional[ChatService] = None
 code_completion_service: Optional[CodeCompletionService] = None
 tool_executor: Optional[ToolExecutor] = None
 agent_planner: Optional[AgentPlanner] = None
+edit_history: Optional[EditHistory] = None
+
+class WriteFileBody(BaseModel):
+    content: str
+
+class ApplyEditItem(BaseModel):
+    file_path: str
+    proposed: str
+
+class ApplyEditsBody(BaseModel):
+    request_id: str
+    edits: List[ApplyEditItem]
+
+class UndoEditsBody(BaseModel):
+    request_id: str
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize services on startup, cleanup on shutdown"""
     global repository_manager, embedding_service, ast_service, search_service
-    global chat_service, code_completion_service, tool_executor, agent_planner
+    global chat_service, code_completion_service, tool_executor, agent_planner, edit_history
     
     logger.info("Initializing services...")
     
@@ -59,6 +76,7 @@ async def lifespan(app: FastAPI):
     code_completion_service = CodeCompletionService()
     tool_executor = ToolExecutor(repository_manager, ast_service, search_service)
     agent_planner = AgentPlanner(tool_executor, chat_service)
+    edit_history = EditHistory()
     
     logger.info("Services initialized successfully")
     
@@ -149,6 +167,77 @@ async def read_file(repo_id: str, file_path: str):
     except Exception as e:
         logger.error(f"Read file error: {e}")
         raise HTTPException(status_code=404, detail=str(e))
+
+@app.post("/api/repositories/{repo_id}/file/{file_path:path}")
+async def write_file(repo_id: str, file_path: str, body: WriteFileBody):
+    """Write file content to disk"""
+    try:
+        result = await repository_manager.write_file(repo_id, file_path, body.content)
+        return result
+    except Exception as e:
+        logger.error(f"Write file error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/repositories/{repo_id}/edits/apply")
+async def apply_edits(repo_id: str, body: ApplyEditsBody):
+    """Apply proposed edits after snapshotting current contents for undo."""
+    if repo_id in ("local", "none", "__none__"):
+        raise HTTPException(
+            status_code=400,
+            detail="Local sessions apply edits on the client",
+        )
+    try:
+        snapshots = []
+        applied = []
+        for edit in body.edits:
+            file_path = edit.file_path.replace("\\", "/")
+            try:
+                before = await repository_manager.read_file(repo_id, file_path)
+            except FileNotFoundError:
+                before = ""
+            except Exception:
+                before = ""
+
+            snapshots.append({
+                "file_path": file_path,
+                "before": before,
+                "after": edit.proposed,
+            })
+            await repository_manager.write_file(repo_id, file_path, edit.proposed)
+            applied.append({"file_path": file_path, "status": "applied"})
+
+        edit_history.save_snapshot(repo_id, body.request_id, snapshots)
+        return {"applied": applied, "request_id": body.request_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Apply edits error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/repositories/{repo_id}/edits/undo")
+async def undo_edits(repo_id: str, body: UndoEditsBody):
+    """Restore files from the last apply snapshot for this request."""
+    if repo_id in ("local", "none", "__none__"):
+        raise HTTPException(
+            status_code=400,
+            detail="Local sessions undo edits on the client",
+        )
+    try:
+        entry = edit_history.pop(repo_id, body.request_id)
+        if not entry:
+            raise HTTPException(status_code=404, detail="No undo snapshot for this request")
+
+        undone = []
+        for snap in entry.files:
+            await repository_manager.write_file(repo_id, snap.file_path, snap.before)
+            undone.append({"file_path": snap.file_path, "status": "undone"})
+
+        return {"undone": undone, "request_id": body.request_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Undo edits error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.websocket("/ws/chat/{repo_id}")
 async def websocket_chat(websocket: WebSocket, repo_id: str):

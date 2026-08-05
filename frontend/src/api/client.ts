@@ -79,9 +79,35 @@ class APIClient {
     filePath: string,
     content: string
   ): Promise<{ status: string }> {
+    const normalizedPath = filePath.replace(/\\/g, '/');
     const response = await this.client.post(
-      `/api/repositories/${repoId}/file/${filePath}`,
+      `/api/repositories/${repoId}/file/${normalizedPath}`,
       { content }
+    );
+    return response.data;
+  }
+
+  async applyEdits(
+    repoId: string,
+    payload: {
+      request_id: string;
+      edits: Array<{ file_path: string; proposed: string }>;
+    }
+  ): Promise<{ applied: Array<{ file_path: string; status: string }>; request_id: string }> {
+    const response = await this.client.post(
+      `/api/repositories/${repoId}/edits/apply`,
+      payload
+    );
+    return response.data;
+  }
+
+  async undoEdits(
+    repoId: string,
+    requestId: string
+  ): Promise<{ undone: Array<{ file_path: string; status: string }>; request_id: string }> {
+    const response = await this.client.post(
+      `/api/repositories/${repoId}/edits/undo`,
+      { request_id: requestId }
     );
     return response.data;
   }

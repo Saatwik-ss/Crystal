@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useAppStore } from '../store';
 import { apiClient, LOCAL_SESSION_ID } from '../api/client';
+import EditProposalCard from './EditProposalCard';
 import { Send, Trash2, X } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -10,6 +11,8 @@ export default function ChatSidebar() {
     chatMessages,
     streamingContent,
     isStreaming,
+    statusLine,
+    pendingEdits,
     addChatMessage,
     clearChatMessages,
     startChatStream,
@@ -28,7 +31,7 @@ export default function ChatSidebar() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [chatMessages, streamingContent]);
+  }, [chatMessages, streamingContent, pendingEdits, statusLine]);
 
   const handleSendMessage = async () => {
     if (!input.trim() || isStreaming) return;
@@ -46,9 +49,14 @@ export default function ChatSidebar() {
     startChatStream();
 
     const activeContent = activeFile ? openFiles.get(activeFile)?.content : undefined;
+    // Prefer full open file for edit proposals; fall back to selection / truncated buffer
     const codeContext =
       selectedCode ||
-      (activeContent ? activeContent.slice(0, 4000) : undefined);
+      (activeContent
+        ? activeContent.length > 12000
+          ? activeContent.slice(0, 12000)
+          : activeContent
+        : undefined);
 
     try {
       await apiClient.sendChatMessage(
@@ -97,7 +105,7 @@ export default function ChatSidebar() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {chatMessages.length === 0 && !isStreaming && (
+        {chatMessages.length === 0 && !isStreaming && !pendingEdits && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center text-gray-400">
               <p className="text-sm">Ask anything about code</p>
@@ -151,8 +159,14 @@ export default function ChatSidebar() {
           </div>
         )}
 
+        {isStreaming && !streamingContent && statusLine && (
+          <p className="text-xs text-gray-500 px-1">{statusLine}</p>
+        )}
+
         <div ref={messagesEndRef} />
       </div>
+
+      <EditProposalCard />
 
       <div className="p-4 border-t border-gray-700">
         <div className="flex gap-2">

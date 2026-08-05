@@ -5,7 +5,11 @@ import type {
   FileContent,
   ChatMessage,
   IndexingStatus,
+  ProposedEdit,
+  AppliedEditSnapshot,
 } from '../types';
+import { apiClient, LOCAL_SESSION_ID } from '../api/client';
+import { getMonacoLanguage } from '../utils/language';
 
 interface AppStore {
   // Repository state
@@ -21,7 +25,7 @@ interface AppStore {
   activeFile: string | null;
   selectedCode: string | null;
   selectedCodeRange?: { start: number; end: number };
-  
+
   openFile: (file: FileContent) => void;
   closeFile: (path: string) => void;
   setActiveFile: (path: string) => void;
@@ -37,27 +41,103 @@ interface AppStore {
   chatError: string | null;
   streamingContent: string;
   isStreaming: boolean;
+  statusLine: string | null;
 
   addChatMessage: (message: ChatMessage) => void;
   clearChatMessages: () => void;
   setChatLoading: (loading: boolean) => void;
   setChatError: (error: string | null) => void;
   startChatStream: () => void;
-  handleChatWsMessage: (message: { type?: string; content?: string; error?: string; tool?: string; args?: Record<string, unknown> }) => void;
+  handleChatWsMessage: (message: {
+    type?: string;
+    content?: string;
+    error?: string;
+    tool?: string;
+    args?: Record<string, unknown>;
+    request_id?: string;
+    edits?: ProposedEdit[];
+  }) => void;
+
+  // Edit proposals
+  pendingEdits: ProposedEdit[] | null;
+  activeRequestId: string | null;
+  lastAppliedRequest: AppliedEditSnapshot | null;
+  editApplying: boolean;
+  applyPendingEdits: () => Promise<void>;
+  rejectPendingEdits: () => void;
+  undoLastApply: () => Promise<void>;
 
   // UI state
   sidebarOpen: boolean;
   explorerExpanded: Map<string, boolean>;
-  
+
   toggleSidebar: () => void;
   toggleExplorerNode: (path: string) => void;
-  
+
   // File explorer state
   expandedFolders: Set<string>;
   toggleFolder: (path: string) => void;
 }
 
-export const useAppStore = create<AppStore>((set) => ({
+function overviewMessage(
+  verb: string,
+  edits: ProposedEdit[],
+): ChatMessage {
+  const lines = edits.map((e) => {
+    const name = e.file_path.split('/').pop() || e.file_path;
+    const note = e.rationale?.trim() || (e.is_new_file ? 'new file' : 'updated');
+    return `• ${name}: ${note}`;
+  });
+  return {
+    role: 'assistant',
+    content: `${verb}\n${lines.join('\n')}`,
+    type: 'message',
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function applyEditsToOpenTabs(
+  state: {
+    openFiles: Map<string, FileContent>;
+    localFiles: FileContent[];
+    activeFile: string | null;
+  },
+  edits: ProposedEdit[],
+  useProposed: boolean,
+): Partial<AppStore> {
+  const newOpenFiles = new Map(state.openFiles);
+  let localFiles = [...state.localFiles];
+  let activeFile = state.activeFile;
+
+  for (const edit of edits) {
+    const path = edit.file_path.replace(/\\/g, '/');
+    const content = useProposed ? edit.proposed : edit.original;
+    const existing = newOpenFiles.get(path);
+    const language = existing?.language || getMonacoLanguage(path);
+    const file: FileContent = { path, content, language };
+    newOpenFiles.set(path, file);
+
+    const localIdx = localFiles.findIndex((f) => f.path === path);
+    if (localIdx >= 0) {
+      localFiles[localIdx] = file;
+    } else if (!useProposed && edit.is_new_file) {
+      // Undoing a new file: remove from local list if it was created
+      localFiles = localFiles.filter((f) => f.path !== path);
+      newOpenFiles.delete(path);
+      if (activeFile === path) {
+        const remaining = Array.from(newOpenFiles.keys());
+        activeFile = remaining.length ? remaining[remaining.length - 1] : null;
+      }
+      continue;
+    } else if (useProposed && !existing) {
+      localFiles = [...localFiles, file];
+    }
+  }
+
+  return { openFiles: newOpenFiles, localFiles, activeFile };
+}
+
+export const useAppStore = create<AppStore>((set, get) => ({
   // Repository state
   currentRepository: null,
   repositoryFiles: [],
@@ -68,12 +148,13 @@ export const useAppStore = create<AppStore>((set) => ({
       indexingStatus: null,
       repositoryFiles: [],
     }),
-  setRepositoryFiles: (files) => set({
-    repositoryFiles: files.map((file) => ({
-      ...file,
-      path: file.path.replace(/\\/g, '/'),
-    })),
-  }),
+  setRepositoryFiles: (files) =>
+    set({
+      repositoryFiles: files.map((file) => ({
+        ...file,
+        path: file.path.replace(/\\/g, '/'),
+      })),
+    }),
   setIndexingStatus: (status) => set({ indexingStatus: status }),
 
   // Editor state
@@ -159,19 +240,29 @@ export const useAppStore = create<AppStore>((set) => ({
   chatError: null,
   streamingContent: '',
   isStreaming: false,
+  statusLine: null,
 
   addChatMessage: (message) =>
     set((state) => ({
       chatMessages: [...state.chatMessages, message],
     })),
 
-  clearChatMessages: () => set({ chatMessages: [], streamingContent: '', isStreaming: false }),
+  clearChatMessages: () =>
+    set({
+      chatMessages: [],
+      streamingContent: '',
+      isStreaming: false,
+      statusLine: null,
+      pendingEdits: null,
+      activeRequestId: null,
+    }),
 
   setChatLoading: (loading) => set({ chatLoading: loading }),
 
   setChatError: (error) => set({ chatError: error }),
 
-  startChatStream: () => set({ streamingContent: '', isStreaming: true }),
+  startChatStream: () =>
+    set({ streamingContent: '', isStreaming: true, statusLine: null }),
 
   handleChatWsMessage: (message) =>
     set((state) => {
@@ -181,6 +272,48 @@ export const useAppStore = create<AppStore>((set) => ({
         return {
           streamingContent: state.streamingContent + (message.content ?? ''),
           isStreaming: true,
+          statusLine: null,
+        };
+      }
+
+      if (message.type === 'response') {
+        return { isStreaming: true, statusLine: null };
+      }
+
+      if (message.type === 'planning') {
+        return {
+          statusLine: message.content || 'Planning…',
+          isStreaming: true,
+        };
+      }
+
+      if (message.type === 'tool_call') {
+        return {
+          statusLine: `Running ${message.tool ?? 'tool'}…`,
+          isStreaming: true,
+        };
+      }
+
+      if (message.type === 'tool_result') {
+        return {
+          statusLine: message.tool ? `Finished ${message.tool}` : null,
+          isStreaming: true,
+        };
+      }
+
+      if (message.type === 'edit_proposal') {
+        const edits = (message.edits ?? []).map((e) => ({
+          ...e,
+          file_path: (e.file_path || '').replace(/\\/g, '/'),
+          validation: e.validation ?? { ok: true, errors: [] },
+        }));
+        return {
+          pendingEdits: edits,
+          activeRequestId: message.request_id ?? null,
+          isStreaming: true,
+          statusLine: edits.length
+            ? `Proposed ${edits.length} edit${edits.length === 1 ? '' : 's'} — review below`
+            : null,
         };
       }
 
@@ -188,6 +321,7 @@ export const useAppStore = create<AppStore>((set) => ({
         return {
           streamingContent: '',
           isStreaming: false,
+          statusLine: null,
           chatMessages: [
             ...state.chatMessages,
             {
@@ -202,12 +336,13 @@ export const useAppStore = create<AppStore>((set) => ({
 
       if (message.type === 'end') {
         if (!state.streamingContent) {
-          return { streamingContent: '', isStreaming: false };
+          return { streamingContent: '', isStreaming: false, statusLine: null };
         }
 
         return {
           streamingContent: '',
           isStreaming: false,
+          statusLine: null,
           chatMessages: [
             ...state.chatMessages,
             {
@@ -224,6 +359,7 @@ export const useAppStore = create<AppStore>((set) => ({
         return {
           streamingContent: '',
           isStreaming: false,
+          statusLine: null,
           chatMessages: [
             ...state.chatMessages,
             {
@@ -236,17 +372,135 @@ export const useAppStore = create<AppStore>((set) => ({
         };
       }
 
-      if (message.type === 'tool_call') {
-        return {
-          streamingContent:
-            state.streamingContent +
-            `\nCalling tool: ${message.tool ?? 'unknown'}\nArgs: ${JSON.stringify(message.args ?? {})}\n`,
-          isStreaming: true,
-        };
-      }
-
       return state;
     }),
+
+  // Edit proposals
+  pendingEdits: null,
+  activeRequestId: null,
+  lastAppliedRequest: null,
+  editApplying: false,
+
+  applyPendingEdits: async () => {
+    const state = get();
+    const edits = state.pendingEdits;
+    const requestId = state.activeRequestId;
+    if (!edits?.length || !requestId || state.editApplying) return;
+
+    const hasInvalid = edits.some((e) => e.validation && e.validation.ok === false);
+    if (hasInvalid) return;
+
+    set({ editApplying: true });
+    const repoId = state.currentRepository?.id;
+    const isLocal = !repoId || repoId === LOCAL_SESSION_ID;
+
+    // Prefer live editor/disk originals for accurate undo (chat buffer may be truncated)
+    const editsForUndo: ProposedEdit[] = edits.map((e) => {
+      const path = e.file_path.replace(/\\/g, '/');
+      const open = state.openFiles.get(path);
+      const local = state.localFiles.find((f) => f.path === path);
+      const liveOriginal = open?.content ?? local?.content;
+      if (liveOriginal !== undefined) {
+        return { ...e, original: liveOriginal, is_new_file: false };
+      }
+      return e;
+    });
+
+    try {
+      if (!isLocal) {
+        await apiClient.applyEdits(repoId, {
+          request_id: requestId,
+          edits: edits.map((e) => ({
+            file_path: e.file_path,
+            proposed: e.proposed,
+          })),
+        });
+      }
+
+      set((s) => {
+        const tabUpdates = applyEditsToOpenTabs(s, editsForUndo, true);
+        return {
+          ...tabUpdates,
+          pendingEdits: null,
+          activeRequestId: null,
+          lastAppliedRequest: { request_id: requestId, edits: editsForUndo },
+          editApplying: false,
+          chatMessages: [...s.chatMessages, overviewMessage('Applied changes:', editsForUndo)],
+        };
+      });
+    } catch (error) {
+      console.error('Failed to apply edits:', error);
+      set((s) => ({
+        editApplying: false,
+        chatMessages: [
+          ...s.chatMessages,
+          {
+            role: 'assistant',
+            content: `Failed to apply edits: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            type: 'error',
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      }));
+    }
+  },
+
+  rejectPendingEdits: () => {
+    const state = get();
+    const edits = state.pendingEdits;
+    if (!edits?.length) {
+      set({ pendingEdits: null, activeRequestId: null });
+      return;
+    }
+    set((s) => ({
+      pendingEdits: null,
+      activeRequestId: null,
+      chatMessages: [...s.chatMessages, overviewMessage('Rejected proposed changes:', edits)],
+    }));
+  },
+
+  undoLastApply: async () => {
+    const state = get();
+    const last = state.lastAppliedRequest;
+    if (!last || state.editApplying) return;
+
+    set({ editApplying: true });
+    const repoId = state.currentRepository?.id;
+    const isLocal = !repoId || repoId === LOCAL_SESSION_ID;
+
+    try {
+      if (!isLocal) {
+        await apiClient.undoEdits(repoId, last.request_id);
+      }
+
+      set((s) => {
+        const tabUpdates = applyEditsToOpenTabs(s, last.edits, false);
+        return {
+          ...tabUpdates,
+          lastAppliedRequest: null,
+          editApplying: false,
+          chatMessages: [
+            ...s.chatMessages,
+            overviewMessage('Undid applied changes:', last.edits),
+          ],
+        };
+      });
+    } catch (error) {
+      console.error('Failed to undo edits:', error);
+      set((s) => ({
+        editApplying: false,
+        chatMessages: [
+          ...s.chatMessages,
+          {
+            role: 'assistant',
+            content: `Failed to undo: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            type: 'error',
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      }));
+    }
+  },
 
   // UI state
   sidebarOpen: true,
