@@ -151,19 +151,6 @@ class RepositoryManager:
                             repo_id,
                             chunks,
                         )
-                    # #region agent log
-                    try:
-                        from debug_log import debug_log
-                        debug_log("A", "repository_manager.py:index_repository", "chunked file during indexing", {
-                            "repo_id": repo_id,
-                            "relative_path": str(relative_path),
-                            "chunk_count": len(chunks),
-                            "stored_to_chroma": bool(chunks),
-                            "symbol_types": list({c.get("symbol_type") for c in chunks}) if chunks else [],
-                        })
-                    except Exception:
-                        pass
-                    # #endregion
                     
                     self.indexing_status[repo_id]["files_processed"] = idx + 1
                     

@@ -74,9 +74,13 @@ async def lifespan(app: FastAPI):
     search_service = SearchService(embedding_service)
     chat_service = ChatService()
     code_completion_service = CodeCompletionService()
-    tool_executor = ToolExecutor(repository_manager, ast_service, search_service)
-    agent_planner = AgentPlanner(tool_executor, chat_service)
+    tool_executor = ToolExecutor(
+        repository_manager, ast_service, search_service, edit_history=None
+    )
+    # edit_history created next; wire after both exist
     edit_history = EditHistory()
+    tool_executor.edit_history = edit_history
+    agent_planner = AgentPlanner(tool_executor, chat_service)
     
     logger.info("Services initialized successfully")
     
@@ -262,7 +266,11 @@ async def websocket_chat(websocket: WebSocket, repo_id: str):
                 repo_id=repo_id,
                 context=repo_context,
                 selected_file=data.get("selected_file"),
-                selected_code=data.get("selected_code")
+                selected_code=data.get("selected_code"),
+                api_key=data.get("api_key"),
+                model=data.get("model"),
+                user_system_prompt=data.get("system_prompt"),
+                enable_planning=bool(data.get("enable_planning")),
             ):
                 await websocket.send_json(chunk)
                 
@@ -303,7 +311,11 @@ async def websocket_completion(websocket: WebSocket, repo_id: str):
                 prompt=data.get("prompt"),
                 file_path=data.get("file_path"),
                 repo_context=repo_context,
-                language=data.get("language", "javascript")
+                language=data.get("language", "javascript"),
+                api_key=data.get("api_key"),
+                model=data.get("model"),
+                user_system_prompt=data.get("system_prompt"),
+                suffix=data.get("suffix") or "",
             ):
                 if isinstance(chunk, str):
                     await websocket.send_json(json.loads(chunk))

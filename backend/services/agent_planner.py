@@ -4,36 +4,99 @@ import re
 import uuid
 import difflib
 from typing import AsyncIterator, Dict, List, Any, Optional, Tuple
-import os
 
 from services.tool_executor import AGENT_TOOL_NAMES
+from services.llm_config import (
+    CHAT_MAX_TOKENS,
+    DEFAULT_API_KEY,
+    DEFAULT_MODEL,
+    EDIT_TOOL_MAX_TOKENS,
+    MAX_AGENT_STEPS,
+    SELECTED_CODE_CHAR_CAP,
+    TOOL_MAX_TOKENS,
+    TOOL_RESULT_CHAR_CAP,
+    extract_failed_generation,
+    fit_max_tokens,
+    friendly_llm_error,
+    get_groq_client,
+    is_payload_too_large_error,
+    is_tool_use_failed_error,
+    is_tools_not_supported_error,
+    is_unsupported_chat_model_error,
+    merge_system_prompt,
+    normalize_tool_args,
+    parse_max_tokens_limit,
+    supports_tools,
+    trim_messages_to_budget,
+    truncate_text,
+)
 
 logger = logging.getLogger(__name__)
 
-LOCAL_EDIT_TOOLS = {"propose_edit"}
+LOCAL_EDIT_TOOLS = {
+    "propose_edit",
+    "apply_patch",
+    "create_plan",
+    "update_todo",
+    "run_terminal",
+    "finish",
+    "read_file",
+}
+
+PLANNING_TOOLS = {"create_plan", "update_todo"}
+
+# Direct (Plan-off) edits: change/create files without formal planning.
+DIRECT_EDIT_TOOLS = {
+    "propose_edit",
+    "apply_patch",
+    "read_file",
+    "finish",
+}
+
+DIRECT_REPO_TOOLS = AGENT_TOOL_NAMES - PLANNING_TOOLS
+
+DIRECT_MAX_STEPS = 6
+
+IMPL_HINTS = re.compile(
+    r"\b(implement|refactor|fix|add|create|update|change|rewrite|migrate|"
+    r"debug|build|write|patch|edit|remove|delete|rename|test)\b",
+    re.IGNORECASE,
+)
+
+# #region agent log
+_DEBUG_LOG_PATH = r"C:\Users\saatw\Downloads\crystal\debug-afc31b.log"
+
+
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        import time
+        payload = {
+            "sessionId": "afc31b",
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 
 class AgentPlanner:
     """
-    Orchestrates agent workflows using LLM and tools.
-    Plans actions, calls tools, and streams responses.
+    Multi-step agent: plan → explore → patch → verify → finish.
     """
 
     def __init__(self, tool_executor, chat_service):
         self.tool_executor = tool_executor
         self.chat_service = chat_service
-        self.model_name = os.getenv("GROQ_MODEL") or os.getenv("LLM_MODEL") or "llama-3.3-70b-versatile"
-        self.api_key = os.getenv("GROQ_API_KEY")
-
-        if self.api_key:
-            try:
-                from groq import Groq
-                self.client = Groq(api_key=self.api_key)
-                self.initialized = True
-            except ImportError:
-                self.initialized = False
-        else:
-            self.initialized = False
+        self.model_name = DEFAULT_MODEL
+        self.api_key = DEFAULT_API_KEY
+        self.client, _, self.initialized = get_groq_client()
 
     async def process_user_request(
         self,
@@ -42,124 +105,327 @@ class AgentPlanner:
         context: Dict[str, Any] = None,
         selected_file: str = None,
         selected_code: str = None,
-        conversation_history: List[Dict[str, str]] = None
+        conversation_history: List[Dict[str, str]] = None,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        user_system_prompt: Optional[str] = None,
+        enable_planning: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         if conversation_history is None:
             conversation_history = []
 
-        try:
-            system_prompt = self._build_agent_system_prompt(context, selected_file, selected_code)
+        client, model_name, initialized = get_groq_client(
+            user_key=api_key,
+            user_model=model,
+            fallback_client=self.client,
+            fallback_key=self.api_key,
+        )
 
-            messages = [{"role": "system", "content": system_prompt}, *conversation_history]
-            messages.append({
-                "role": "user",
-                "content": message
-            })
+        request_id = str(uuid.uuid4())
+        proposed_edits: List[Dict[str, Any]] = []
+
+        try:
+            if enable_planning:
+                base_prompt = self._build_agent_system_prompt(
+                    context, selected_file, selected_code
+                )
+            else:
+                base_prompt = self._build_chat_system_prompt(
+                    context, selected_file, selected_code
+                )
+            system_prompt = merge_system_prompt(base_prompt, user_system_prompt)
+
+            messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                *conversation_history,
+                {"role": "user", "content": message},
+            ]
 
             has_repo = repo_id not in ("local", "none", "__none__", None, "")
             has_indexed_files = bool((context or {}).get("total_files"))
             local_edit_mode = (not has_indexed_files) and bool(selected_file)
-            use_tools = (has_repo and has_indexed_files) or local_edit_mode
+            local_session = not has_indexed_files
+            wants_impl = bool(IMPL_HINTS.search(message or ""))
+            model_supports_tools = supports_tools(model_name)
+            use_tools = (
+                model_supports_tools
+                and (
+                    (has_repo and has_indexed_files)
+                    or local_edit_mode
+                    or (has_repo and wants_impl)
+                    or (local_session and wants_impl)
+                )
+            )
 
-            if not self.initialized:
+            if not initialized:
                 yield {
                     "type": "message",
-                    "content": "Mock response. Configure GROQ_API_KEY for full agent capabilities."
+                    "content": "Mock response. Configure GROQ_API_KEY for full agent capabilities.",
                 }
                 return
 
             if not use_tools:
-                async for event in self._stream_final_response(messages):
+                if not model_supports_tools:
+                    yield {
+                        "type": "planning",
+                        "content": (
+                            f"{model_name} does not support Crystal tools — "
+                            "answering in chat mode. Use llama-3.3-70b-versatile "
+                            "or openai/gpt-oss-120b for agent edits."
+                        ),
+                    }
+                async for event in self._stream_final_response(
+                    messages, client, model_name
+                ):
                     yield event
                 yield {"type": "end"}
                 return
 
-            if local_edit_mode:
-                tools = self.tool_executor.get_tool_schemas(LOCAL_EDIT_TOOLS)
+            if enable_planning:
+                if local_session:
+                    tool_names = set(LOCAL_EDIT_TOOLS)
+                else:
+                    tool_names = set(AGENT_TOOL_NAMES)
+                max_steps = MAX_AGENT_STEPS
             else:
-                tools = self.tool_executor.get_agent_tool_schemas()
+                if local_session:
+                    tool_names = set(DIRECT_EDIT_TOOLS)
+                else:
+                    tool_names = set(DIRECT_REPO_TOOLS)
+                max_steps = min(DIRECT_MAX_STEPS, MAX_AGENT_STEPS)
 
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    max_tokens=8192,
-                    temperature=0,
-                )
-            except Exception as api_error:
-                recovered = self._recover_failed_tool_generation(str(api_error))
-                if recovered:
-                    tool_name, tool_args = recovered
-                    async for event in self._execute_recovered_tool(
-                        repo_id, tool_name, tool_args, messages,
-                        selected_file=selected_file,
-                        selected_code=selected_code,
-                    ):
-                        yield event
-                    return
+            tools = self.tool_executor.get_tool_schemas(tool_names)
 
-                async for event in self._fallback_chat_response(messages):
-                    yield event
-                return
+            soft_apply = has_repo and has_indexed_files
+            self.tool_executor.begin_session(
+                request_id,
+                repo_id=repo_id or "",
+                soft_apply=soft_apply,
+                selected_file=selected_file,
+                selected_code=selected_code,
+            )
 
-            assistant_message = response.choices[0].message
+            if enable_planning:
+                yield {"type": "planning", "content": "Starting agent loop…"}
 
-            if assistant_message.tool_calls:
-                yield {
-                    "type": "planning",
-                    "content": "Planning actions..."
-                }
+            done = False
 
-                tool_results = []
-                proposed_edits: List[Dict[str, Any]] = []
-
-                for tool_call in assistant_message.tool_calls:
-                    tool_name = tool_call.function.name
-                    raw_arguments = tool_call.function.arguments
-                    tool_args = json.loads(raw_arguments) if raw_arguments else {}
-                    if not isinstance(tool_args, dict):
-                        tool_args = {}
-
+            for step in range(1, max_steps + 1):
+                if enable_planning:
                     yield {
-                        "type": "tool_call",
-                        "tool": tool_name,
-                        "args": {k: v for k, v in tool_args.items() if k != "new_content"},
+                        "type": "step",
+                        "step": step,
+                        "max_steps": max_steps,
+                        "content": f"Step {step}/{max_steps}",
                     }
 
-                    result = await self.tool_executor.execute_tool(
-                        tool_name,
-                        repo_id,
-                        **(tool_args or {})
+                desired_max = (
+                    EDIT_TOOL_MAX_TOKENS if local_edit_mode else TOOL_MAX_TOKENS
+                )
+                step_messages = trim_messages_to_budget(
+                    messages, reserve_completion=desired_max, tools=tools
+                )
+                tool_max_tokens = fit_max_tokens(
+                    step_messages,
+                    desired_max,
+                    model=model_name,
+                    tools=tools,
+                )
+
+                response = None
+                try:
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=step_messages,
+                        tools=tools,
+                        tool_choice="auto",
+                        max_tokens=tool_max_tokens,
+                        temperature=0.1,
+                    )
+                except Exception as api_error:
+                    logger.warning(
+                        "Agent step %s tool call failed (%s): %s",
+                        step,
+                        model_name,
+                        api_error,
                     )
 
-                    if tool_name == "propose_edit" and result.get("status") == "success":
-                        edit = result.get("result") or {}
-                        edit = self._enrich_edit_original(
-                            edit, selected_file, selected_code
+                    # #region agent log
+                    _agent_dbg(
+                        "A",
+                        "agent_planner.py:tool_error",
+                        "step tool call failed",
+                        {
+                            "step": step,
+                            "model": model_name,
+                            "enable_planning": enable_planning,
+                            "error_head": str(api_error)[:400],
+                            "is_tool_use_failed": is_tool_use_failed_error(api_error),
+                            "has_path_schema_error": "additionalProperties 'path'" in str(api_error)
+                            or "missing properties: 'file_path'" in str(api_error),
+                            "has_harmony_name_error": "Tools should have a name" in str(api_error),
+                            "n_tools": len(tools),
+                            "tool_names": [
+                                (t.get("function") or {}).get("name") for t in tools
+                            ],
+                        },
+                    )
+                    # #endregion
+
+                    if is_tools_not_supported_error(api_error) or (
+                        is_unsupported_chat_model_error(api_error)
+                    ):
+                        yield {
+                            "type": "error",
+                            "error": friendly_llm_error(api_error, model_name),
+                        }
+                        self.tool_executor.end_session()
+                        return
+
+                    recovered = self._recover_failed_tool_generation(
+                        str(api_error), error=api_error
+                    )
+                    # #region agent log
+                    _agent_dbg(
+                        "B",
+                        "agent_planner.py:recovery",
+                        "failed_generation recovery attempt",
+                        {
+                            "step": step,
+                            "recovered": bool(recovered),
+                            "tool_name": recovered[0] if recovered else None,
+                            "arg_keys": list((recovered[1] or {}).keys()) if recovered else None,
+                            "failed_generation_head": (
+                                (extract_failed_generation(api_error) or "")[:300]
+                            ),
+                            "body_type": type(getattr(api_error, "body", None)).__name__,
+                        },
+                    )
+                    # #endregion
+                    if recovered:
+                        tool_name, tool_args = recovered
+                        tool_args = normalize_tool_args(tool_name, tool_args)
+                        # Groq's Harmony formatter requires every tool result
+                        # to follow an assistant message that declares the tool
+                        # call. Recovered calls originate from a rejected API
+                        # request, so add that missing transcript entry before
+                        # _run_single_tool appends the result.
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "recovered_call",
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": json.dumps(tool_args),
+                                },
+                            }],
+                        })
+                        async for event in self._run_single_tool(
+                            repo_id,
+                            tool_name,
+                            tool_args,
+                            "recovered_call",
+                            messages,
+                            proposed_edits,
+                            selected_file=selected_file,
+                            selected_code=selected_code,
+                        ):
+                            yield event
+                        if tool_name == "finish":
+                            done = True
+                            break
+                        continue
+
+                    limit = parse_max_tokens_limit(api_error)
+                    if limit is not None:
+                        tool_max_tokens = min(tool_max_tokens, limit)
+                        try:
+                            response = client.chat.completions.create(
+                                model=model_name,
+                                messages=step_messages,
+                                tools=tools,
+                                tool_choice="auto",
+                                max_tokens=tool_max_tokens,
+                                temperature=0.2,
+                            )
+                        except Exception as retry_error:
+                            yield {
+                                "type": "error",
+                                "error": friendly_llm_error(retry_error, model_name),
+                            }
+                            self.tool_executor.end_session()
+                            return
+                    elif is_payload_too_large_error(api_error):
+                        step_messages = trim_messages_to_budget(
+                            messages, reserve_completion=768, tools=tools
                         )
-                        result = {**result, "result": edit}
-                        proposed_edits.append(edit)
+                        try:
+                            response = client.chat.completions.create(
+                                model=model_name,
+                                messages=step_messages,
+                                tools=tools,
+                                tool_choice="auto",
+                                max_tokens=fit_max_tokens(
+                                    step_messages, 768, model=model_name, tools=tools
+                                ),
+                                temperature=0.2,
+                            )
+                        except Exception:
+                            async for event in self._fallback_chat_response(
+                                messages, client, model_name
+                            ):
+                                yield event
+                            self.tool_executor.end_session()
+                            return
+                    elif is_tool_use_failed_error(api_error):
+                        # #region agent log
+                        _agent_dbg(
+                            "C",
+                            "agent_planner.py:tool_use_failed_retry",
+                            "coaching model instead of blind retry",
+                            {
+                                "step": step,
+                                "n_messages": len(messages),
+                                "tool_names": [
+                                    (t.get("function") or {}).get("name") for t in tools
+                                ],
+                            },
+                        )
+                        # #endregion
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Your last tool call was rejected by the API. "
+                                "Use exact parameter names from the tool schema: "
+                                "file_path (never path), new_content (never content), "
+                                "old_string/new_string for apply_patch. Retry the tool call."
+                            ),
+                        })
+                        continue
+                    else:
+                        async for event in self._fallback_chat_response(
+                            messages, client, model_name
+                        ):
+                            yield event
+                        self.tool_executor.end_session()
+                        return
 
-                    tool_results.append({
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(result)
-                    })
+                if response is None:
+                    break
 
-                    yield {
-                        "type": "tool_result",
-                        "tool": tool_name,
-                        "result": result
-                    }
+                assistant_message = response.choices[0].message
+                tool_calls = assistant_message.tool_calls or []
 
-                request_id = str(uuid.uuid4())
-                if proposed_edits:
-                    yield {
-                        "type": "edit_proposal",
-                        "request_id": request_id,
-                        "edits": proposed_edits,
-                    }
+                if not tool_calls:
+                    if assistant_message.content:
+                        yield {
+                            "type": "message",
+                            "content": assistant_message.content,
+                        }
+                    done = True
+                    break
 
                 messages.append({
                     "role": "assistant",
@@ -170,64 +436,250 @@ class AgentPlanner:
                             "type": "function",
                             "function": {
                                 "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
+                                "arguments": tc.function.arguments,
+                            },
                         }
-                        for tc in assistant_message.tool_calls
-                    ]
+                        for tc in tool_calls
+                    ],
                 })
 
-                for result in tool_results:
+                verify_failures: List[str] = []
+
+                for tool_call in tool_calls:
+                    tool_name = tool_call.function.name
+                    raw_arguments = tool_call.function.arguments
+                    try:
+                        tool_args = json.loads(raw_arguments) if raw_arguments else {}
+                    except json.JSONDecodeError:
+                        tool_args = {}
+                    if not isinstance(tool_args, dict):
+                        tool_args = {}
+                    tool_args = normalize_tool_args(tool_name, tool_args)
+
+                    async for event in self._run_single_tool(
+                        repo_id,
+                        tool_name,
+                        tool_args,
+                        tool_call.id,
+                        messages,
+                        proposed_edits,
+                        selected_file=selected_file,
+                        selected_code=selected_code,
+                        collect_failures=verify_failures if enable_planning else None,
+                    ):
+                        yield event
+
+                    if tool_name == "finish":
+                        done = True
+
+                if done:
+                    break
+
+                if enable_planning and verify_failures:
                     messages.append({
-                        "role": "tool",
-                        "tool_call_id": result["tool_call_id"],
-                        "content": result["content"]
+                        "role": "user",
+                        "content": (
+                            "Fix the failures below, then re-verify with run_terminal "
+                            "or call finish if blocked:\n"
+                            + "\n".join(verify_failures[:5])
+                        ),
                     })
 
-                invalid = [
-                    e for e in proposed_edits
-                    if not (e.get("validation") or {}).get("ok", True)
-                ]
-                overview_hint = (
-                    "Provide a brief overview of the proposed edits only "
-                    "(which files, what changed). Do NOT paste example or "
-                    "sample code. The user will review a diff UI to apply."
-                )
-                if invalid:
-                    paths = ", ".join(e.get("file_path", "?") for e in invalid)
-                    overview_hint += (
-                        f" Note that validation failed for: {paths}. "
-                        "Mention that briefly so the user can Reject or fix."
-                    )
+            session_info = self.tool_executor.end_session()
 
-                messages.append({
-                    "role": "user",
-                    "content": overview_hint,
-                })
+            if proposed_edits:
+                # Prefer first-before / last-after when same file patched multiple times
+                by_path: Dict[str, Dict[str, Any]] = {}
+                for edit in proposed_edits:
+                    path = edit.get("file_path") or ""
+                    if path in by_path:
+                        by_path[path] = {
+                            **edit,
+                            "original": by_path[path].get("original", edit.get("original")),
+                            "proposed": edit.get("proposed"),
+                            "diff": edit.get("diff"),
+                        }
+                    else:
+                        by_path[path] = edit
+                yield {
+                    "type": "edit_proposal",
+                    "request_id": session_info.get("request_id") or request_id,
+                    "edits": list(by_path.values()),
+                    "applied": soft_apply,
+                }
 
-                async for event in self._stream_final_response(messages):
-                    yield event
-            else:
-                if assistant_message.content:
-                    yield {
-                        "type": "message",
-                        "content": assistant_message.content
-                    }
+            if not done:
+                if enable_planning:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Max steps reached. Summarize progress and remaining work. "
+                            "Do not invent unapplied code."
+                        ),
+                    })
+                    async for event in self._stream_final_response(
+                        messages, client, model_name
+                    ):
+                        yield event
+                elif not proposed_edits:
+                    async for event in self._stream_final_response(
+                        messages, client, model_name
+                    ):
+                        yield event
 
-            yield {
-                "type": "end"
-            }
+            yield {"type": "end"}
 
         except Exception as e:
             logger.error(f"Agent processing error: {e}")
-            if "tool_use_failed" in str(e):
-                async for event in self._fallback_chat_response(messages):
+            try:
+                self.tool_executor.end_session()
+            except Exception:
+                pass
+            if "tool_use_failed" in str(e).lower() or is_tools_not_supported_error(e):
+                async for event in self._fallback_chat_response(
+                    messages if "messages" in locals() else [
+                        {"role": "user", "content": message or ""}
+                    ],
+                    client,
+                    model_name,
+                ):
                     yield event
                 return
+            yield {"type": "error", "error": str(e)}
+
+    async def _run_single_tool(
+        self,
+        repo_id: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        tool_call_id: str,
+        messages: List[Dict[str, Any]],
+        proposed_edits: List[Dict[str, Any]],
+        selected_file: str = None,
+        selected_code: str = None,
+        collect_failures: Optional[List[str]] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        safe_args = {
+            k: v for k, v in (tool_args or {}).items()
+            if k not in ("new_content", "old_string", "new_string")
+        }
+        yield {"type": "tool_call", "tool": tool_name, "args": safe_args}
+
+        result = await self.tool_executor.execute_tool(
+            tool_name, repo_id, **(tool_args or {})
+        )
+
+        payload = result.get("result") if result.get("status") == "success" else result
+
+        if tool_name in ("propose_edit", "apply_patch") and result.get("status") == "success":
+            edit = payload if isinstance(payload, dict) else {}
+            if tool_name == "propose_edit":
+                edit = self._enrich_edit_original(edit, selected_file, selected_code)
+            if edit.get("file_path"):
+                proposed_edits.append(edit)
+            validation = (edit or {}).get("validation") or {}
+            if not validation.get("ok", True) and collect_failures is not None:
+                errs = validation.get("errors") or [edit.get("error") or "validation failed"]
+                collect_failures.append(
+                    f"{edit.get('file_path')}: " + "; ".join(str(e) for e in errs)
+                )
+
+        if tool_name == "create_plan" and isinstance(payload, dict):
+            yield {"type": "plan", "goal": payload.get("goal"), "todos": payload.get("todos")}
+
+        if tool_name == "update_todo" and isinstance(payload, dict):
             yield {
-                "type": "error",
-                "error": str(e)
+                "type": "todo_update",
+                "id": payload.get("id"),
+                "status": payload.get("status"),
+                "note": payload.get("note"),
+                "plan": payload.get("plan"),
             }
+
+        if tool_name == "run_terminal":
+            term = payload if isinstance(payload, dict) else {"error": str(payload)}
+            yield {
+                "type": "terminal",
+                "command": term.get("command") or tool_args.get("command"),
+                "returncode": term.get("returncode"),
+                "stdout": truncate_text(term.get("stdout") or "", 4000),
+                "stderr": truncate_text(term.get("stderr") or "", 2000),
+                "status": term.get("status") or result.get("status"),
+                "error": term.get("error"),
+            }
+            if collect_failures is not None and (
+                term.get("returncode") not in (0, None)
+                or term.get("status") in ("failed", "error")
+            ):
+                collect_failures.append(
+                    f"Terminal `{term.get('command')}` exit {term.get('returncode')}: "
+                    f"{(term.get('stderr') or term.get('error') or term.get('stdout') or '')[:800]}"
+                )
+
+        if tool_name == "finish" and isinstance(payload, dict) and payload.get("summary"):
+            yield {"type": "message", "content": payload["summary"]}
+
+        # Compact result for the model context
+        tool_content = self._compact_tool_result(tool_name, result)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": tool_content,
+        })
+
+        yield {
+            "type": "tool_result",
+            "tool": tool_name,
+            "result": self._public_tool_result(tool_name, result),
+        }
+
+    def _compact_tool_result(self, tool_name: str, result: Dict[str, Any]) -> str:
+        data = result.get("result") if result.get("status") == "success" else result
+        if tool_name in ("propose_edit", "apply_patch") and isinstance(data, dict):
+            slim = {
+                "file_path": data.get("file_path"),
+                "applied": data.get("applied"),
+                "validation": data.get("validation"),
+                "rationale": data.get("rationale"),
+                "is_new_file": data.get("is_new_file"),
+                "error": data.get("error"),
+                "diff_preview": truncate_text(data.get("diff") or "", 1500),
+            }
+            return truncate_text(json.dumps(slim), TOOL_RESULT_CHAR_CAP)
+        if tool_name == "read_file" and isinstance(data, str):
+            return truncate_text(data, TOOL_RESULT_CHAR_CAP)
+        if tool_name == "run_terminal" and isinstance(data, dict):
+            slim = {
+                "command": data.get("command"),
+                "returncode": data.get("returncode"),
+                "status": data.get("status"),
+                "stdout": truncate_text(data.get("stdout") or "", 3000),
+                "stderr": truncate_text(data.get("stderr") or "", 1500),
+                "error": data.get("error"),
+            }
+            return truncate_text(json.dumps(slim), TOOL_RESULT_CHAR_CAP)
+        try:
+            return truncate_text(json.dumps(data, default=str), TOOL_RESULT_CHAR_CAP)
+        except Exception:
+            return truncate_text(str(data), TOOL_RESULT_CHAR_CAP)
+
+    def _public_tool_result(self, tool_name: str, result: Dict[str, Any]) -> Any:
+        """UI-facing result without huge file bodies."""
+        if result.get("status") != "success":
+            return result
+        data = result.get("result")
+        if tool_name in ("propose_edit", "apply_patch") and isinstance(data, dict):
+            return {
+                "file_path": data.get("file_path"),
+                "applied": data.get("applied"),
+                "validation": data.get("validation"),
+                "rationale": data.get("rationale"),
+                "is_new_file": data.get("is_new_file"),
+                "error": data.get("error"),
+            }
+        if tool_name == "read_file" and isinstance(data, str):
+            return truncate_text(data, 2000)
+        return data
 
     def _enrich_edit_original(
         self,
@@ -262,125 +714,166 @@ class AgentPlanner:
             }
         return edit
 
-    def _recover_failed_tool_generation(self, error_text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-        tool_match = re.search(
-            r"<function=(\w+)\s*(\{.*?\})\s*</function>",
-            error_text,
-            re.DOTALL,
-        )
-        if not tool_match:
-            return None
-
-        tool_name, raw_args = tool_match.group(1), tool_match.group(2)
-        if tool_name not in AGENT_TOOL_NAMES:
-            return None
-
-        try:
-            return tool_name, json.loads(raw_args)
-        except json.JSONDecodeError:
-            logger.warning("Could not parse recovered tool arguments: %s", raw_args)
-            return None
-
-    async def _execute_recovered_tool(
+    def _recover_failed_tool_generation(
         self,
-        repo_id: str,
-        tool_name: str,
-        tool_args: Dict[str, Any],
-        messages: List[Dict[str, Any]],
-        selected_file: str = None,
-        selected_code: str = None,
-    ) -> AsyncIterator[Dict[str, Any]]:
-        yield {"type": "planning", "content": "Planning actions..."}
-        yield {
-            "type": "tool_call",
-            "tool": tool_name,
-            "args": {k: v for k, v in (tool_args or {}).items() if k != "new_content"},
-        }
+        error_text: str,
+        error: Any = None,
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        candidates = [error_text]
+        failed = extract_failed_generation(error) if error is not None else None
+        if failed:
+            candidates.insert(0, failed)
 
-        result = await self.tool_executor.execute_tool(tool_name, repo_id, **(tool_args or {}))
-        proposed_edits = []
-        if tool_name == "propose_edit" and result.get("status") == "success":
-            edit = self._enrich_edit_original(
-                result.get("result") or {}, selected_file, selected_code
+        for blob in candidates:
+            if not blob:
+                continue
+
+            tool_match = re.search(r"<function=(\w+)\s*>?\s*", blob)
+            if tool_match:
+                tool_name = tool_match.group(1)
+                rest = blob[tool_match.end():].lstrip()
+                if tool_name in AGENT_TOOL_NAMES and rest.startswith("{"):
+                    try:
+                        args, _ = json.JSONDecoder().raw_decode(rest)
+                        if isinstance(args, dict):
+                            return tool_name, normalize_tool_args(tool_name, args)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Could not parse recovered tool arguments for %s",
+                            tool_name,
+                        )
+
+            try:
+                parsed = json.loads(blob) if blob.strip().startswith("{") else None
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                tool_name = parsed.get("name") or parsed.get("tool") or ""
+                raw_args = parsed.get("arguments") or parsed.get("parameters") or {}
+                if tool_name in AGENT_TOOL_NAMES:
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            raw_args = {}
+                    if isinstance(raw_args, dict):
+                        return tool_name, normalize_tool_args(tool_name, raw_args)
+
+            bare = re.search(
+                r"\b("
+                + "|".join(
+                    re.escape(n) for n in sorted(AGENT_TOOL_NAMES, key=len, reverse=True)
+                )
+                + r")\s*\(\s*",
+                blob,
             )
-            result = {**result, "result": edit}
-            proposed_edits.append(edit)
+            if bare:
+                tool_name = bare.group(1)
+                rest = blob[bare.end():].lstrip()
+                if rest.startswith("{"):
+                    try:
+                        args, _ = json.JSONDecoder().raw_decode(rest)
+                        if isinstance(args, dict):
+                            return tool_name, normalize_tool_args(tool_name, args)
+                    except json.JSONDecodeError:
+                        pass
 
-        yield {"type": "tool_result", "tool": tool_name, "result": result}
-
-        if proposed_edits:
-            yield {
-                "type": "edit_proposal",
-                "request_id": str(uuid.uuid4()),
-                "edits": proposed_edits,
-            }
-
-        messages.append({
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "recovered_call",
-                "type": "function",
-                "function": {
-                    "name": tool_name,
-                    "arguments": json.dumps(tool_args),
-                },
-            }],
-        })
-        messages.append({
-            "role": "tool",
-            "tool_call_id": "recovered_call",
-            "content": json.dumps(result),
-        })
-        messages.append({
-            "role": "user",
-            "content": (
-                "Provide a brief overview of the proposed edits only. "
-                "Do NOT paste example code."
-            ),
-        })
-
-        async for event in self._stream_final_response(messages):
-            yield event
-        yield {"type": "end"}
+        return None
 
     async def _fallback_chat_response(
         self,
         messages: List[Dict[str, Any]],
+        client=None,
+        model_name: str = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         logger.warning("Tool calling failed; falling back to direct chat response")
-        yield {"type": "response", "content": ""}
-
-        stream = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            stream=True,
-            max_tokens=2048,
-            temperature=0.2,
-        )
-
-        for chunk in stream:
-            if chunk.choices[0].delta.content:
-                yield {
-                    "type": "content",
-                    "content": chunk.choices[0].delta.content,
-                }
-
-        yield {"type": "end"}
+        async for event in self._stream_chat_completion(
+            messages, client, model_name, end=True
+        ):
+            yield event
 
     async def _stream_final_response(
         self,
         messages: List[Dict[str, Any]],
+        client=None,
+        model_name: str = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        async for event in self._stream_chat_completion(
+            messages, client, model_name, end=False
+        ):
+            yield event
+
+    async def _stream_chat_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        client=None,
+        model_name: str = None,
+        end: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         yield {"type": "response", "content": ""}
 
-        stream = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            stream=True,
-            max_tokens=2048,
-            temperature=0.2,
+        llm = client or self.client
+        model = model_name or self.model_name
+        safe_messages = trim_messages_to_budget(
+            messages, reserve_completion=CHAT_MAX_TOKENS
         )
+        max_out = fit_max_tokens(safe_messages, CHAT_MAX_TOKENS, model=model)
+
+        try:
+            stream = llm.chat.completions.create(
+                model=model,
+                messages=safe_messages,
+                stream=True,
+                max_tokens=max_out,
+                temperature=0.2,
+            )
+        except Exception as api_error:
+            limit = parse_max_tokens_limit(api_error)
+            if limit is not None:
+                try:
+                    stream = llm.chat.completions.create(
+                        model=model,
+                        messages=safe_messages,
+                        stream=True,
+                        max_tokens=min(max_out, limit),
+                        temperature=0.2,
+                    )
+                except Exception as retry_error:
+                    yield {
+                        "type": "error",
+                        "error": friendly_llm_error(retry_error, model),
+                    }
+                    if end:
+                        yield {"type": "end"}
+                    return
+            elif is_payload_too_large_error(api_error):
+                tighter = trim_messages_to_budget(
+                    safe_messages, reserve_completion=512
+                )
+                try:
+                    stream = llm.chat.completions.create(
+                        model=model,
+                        messages=tighter,
+                        stream=True,
+                        max_tokens=fit_max_tokens(tighter, 512, model=model),
+                        temperature=0.2,
+                    )
+                except Exception as retry_error:
+                    yield {
+                        "type": "error",
+                        "error": friendly_llm_error(retry_error, model),
+                    }
+                    if end:
+                        yield {"type": "end"}
+                    return
+            else:
+                yield {
+                    "type": "error",
+                    "error": friendly_llm_error(api_error, model),
+                }
+                if end:
+                    yield {"type": "end"}
+                return
 
         for chunk in stream:
             if chunk.choices[0].delta.content:
@@ -389,38 +882,16 @@ class AgentPlanner:
                     "content": chunk.choices[0].delta.content,
                 }
 
-    def _build_agent_system_prompt(
+        if end:
+            yield {"type": "end"}
+
+    def _append_context(
         self,
+        prompt: str,
         repository_context: Dict[str, Any] = None,
         selected_file: str = None,
-        selected_code: str = None
+        selected_code: str = None,
     ) -> str:
-        has_repo_files = bool((repository_context or {}).get("total_files"))
-        if has_repo_files:
-            prompt = """You are an expert AI coding agent that edits real project files.
-
-Workflow:
-1. Use search_repository / read_file / list_files / ast_lookup to understand the code. Never guess file contents.
-2. When the user wants a code change, call propose_edit with the COMPLETE new file content (full file, not a snippet).
-3. You may call propose_edit multiple times for multiple files.
-4. After tools finish, give a short overview of what will change. Do NOT paste example code, sample snippets, or "for example" demos.
-
-CRITICAL RULES:
-- Never invent illustrative example files or toy snippets.
-- propose_edit.new_content must be the entire file ready to replace the original.
-- Only edit files that are needed for the request.
-- Do not call write_file; the user applies changes from a diff UI after review.
-"""
-        else:
-            prompt = """You are an expert AI coding assistant.
-
-If the user is viewing a file and asks for a change, call propose_edit with that file_path and the COMPLETE updated file content.
-Do NOT paste illustrative examples or "for example" sample code in your reply.
-After proposing, give only a brief overview of the change. The user will review a diff UI to apply.
-
-If they are only asking a question (no edit), answer clearly without dumping unnecessary code samples.
-"""
-
         if repository_context:
             files = repository_context.get("files", [])
             languages = repository_context.get("languages", [])
@@ -438,15 +909,85 @@ If they are only asking a question (no edit), answer clearly without dumping unn
             prompt += f"\nCurrently viewing: {selected_file}\n"
 
         if selected_code:
-            prompt += f"\nCurrent file contents (use this as the base for propose_edit):\n```\n{selected_code[:12000]}\n```\n"
+            clipped = truncate_text(selected_code, SELECTED_CODE_CHAR_CAP)
+            prompt += (
+                "\nThe current file may be unsaved and absent from the repository. "
+                "read_file and apply_patch use its editor buffer during this request. "
+                "Current file contents (use as reference; "
+                "if truncated, preserve omitted sections when suggesting edits):\n"
+                f"```\n{clipped}\n```\n"
+            )
 
         return prompt
+
+    def _build_chat_system_prompt(
+        self,
+        repository_context: Dict[str, Any] = None,
+        selected_file: str = None,
+        selected_code: str = None,
+    ) -> str:
+        """Direct chat + edits — no formal plan / step checklist."""
+        prompt = """You are an expert AI coding assistant.
+
+For questions: answer clearly in chat. Do not invent a multi-step plan.
+
+For code changes (edit current file or create a new file):
+1. Prefer apply_patch for surgical edits to an existing file (exact unique old_string → new_string).
+2. Use propose_edit with full new_content for new files or small full-file rewrites.
+3. Call finish with a brief summary when edits are done.
+4. Do NOT call create_plan or update_todo.
+
+Keep changes minimal and correct. Do not dump huge code blocks in chat when a tool edit was applied.
+"""
+        return self._append_context(
+            prompt, repository_context, selected_file, selected_code
+        )
+
+    def _build_agent_system_prompt(
+        self,
+        repository_context: Dict[str, Any] = None,
+        selected_file: str = None,
+        selected_code: str = None,
+    ) -> str:
+        has_repo_files = bool((repository_context or {}).get("total_files"))
+        if has_repo_files:
+            prompt = """You are an expert AI coding agent working in a real repository.
+
+Workflow (follow this for non-trivial work):
+1. Explore with search_repository / read_file / list_files / ast_lookup / find_references. Never guess file contents.
+2. Call create_plan with a clear goal and ordered steps for multi-file or non-trivial changes.
+3. Work one step at a time. Call update_todo as you start/finish each step.
+4. Prefer apply_patch (exact unique old_string → new_string) for existing files. Use propose_edit only for new or tiny files (full file content).
+5. After edits, verify with run_terminal when a test/lint command is obvious (pytest, npm test, tsc, eslint, ruff, mypy, etc.). Fix failures before finishing.
+6. Call finish with a short summary when done. Do NOT dump large code samples in chat.
+
+CRITICAL RULES:
+- Never invent illustrative toy files.
+- Never skip reading a file before patching it.
+- Keep patches minimal and correct.
+- Soft-applied edits are already on disk for verification; still be careful.
+"""
+        else:
+            prompt = """You are an expert AI coding assistant.
+
+For code changes on the open file:
+1. Call create_plan for multi-step work, then update_todo as you go.
+2. Prefer apply_patch for surgical edits; use propose_edit for full-file rewrites of small/new files.
+3. You may run_terminal for quick checks when useful.
+4. Call finish with a brief overview when done. Do not paste huge code blocks in chat.
+
+For questions only, answer clearly without tools.
+"""
+
+        return self._append_context(
+            prompt, repository_context, selected_file, selected_code
+        )
 
     async def plan_refactoring(
         self,
         code: str,
         goal: str,
-        language: str
+        language: str,
     ) -> Dict[str, Any]:
         prompt = f"""Plan a {language} refactoring with this goal:
 {goal}
@@ -462,10 +1003,7 @@ Provide a structured plan with:
 3. Order of changes
 4. Potential risks
 """
-        return {
-            "type": "plan",
-            "plan": prompt
-        }
+        return {"type": "plan", "plan": prompt}
 
     async def analyze_error(
         self,
@@ -473,12 +1011,9 @@ Provide a structured plan with:
         code: str,
         language: str,
         repo_id: str,
-        repository_context: Dict[str, Any] = None
+        repository_context: Dict[str, Any] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
-        yield {
-            "type": "analysis",
-            "content": "Analyzing error..."
-        }
+        yield {"type": "analysis", "content": "Analyzing error..."}
 
         prompt = f"""Analyze this {language} error:
 
@@ -497,15 +1032,9 @@ First, explain what the error means and why it's happening."""
         async for response in self.chat_service.stream_chat(messages):
             data = json.loads(response)
             if data.get("type") == "content":
-                yield {
-                    "type": "analysis",
-                    "content": data["content"]
-                }
+                yield {"type": "analysis", "content": data["content"]}
 
-        yield {
-            "type": "suggestion",
-            "content": "Suggesting fixes..."
-        }
+        yield {"type": "suggestion", "content": "Suggesting fixes..."}
 
         prompt2 = """Now suggest how to fix this error.
 Provide the corrected code."""
@@ -516,7 +1045,4 @@ Provide the corrected code."""
         async for response in self.chat_service.stream_chat(messages):
             data = json.loads(response)
             if data.get("type") == "content":
-                yield {
-                    "type": "fix",
-                    "content": data["content"]
-                }
+                yield {"type": "fix", "content": data["content"]}

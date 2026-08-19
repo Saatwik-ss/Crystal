@@ -1,8 +1,20 @@
 import logging
-import asyncio
 from typing import AsyncIterator, Dict, List, Any, Optional
-import os
 import json
+
+from services.llm_config import (
+    DEFAULT_API_KEY,
+    DEFAULT_MODEL,
+    SELECTED_CODE_CHAR_CAP,
+    fit_max_tokens,
+    friendly_llm_error,
+    get_groq_client,
+    is_payload_too_large_error,
+    merge_system_prompt,
+    parse_max_tokens_limit,
+    trim_messages_to_budget,
+    truncate_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -13,28 +25,23 @@ class ChatService:
     """
     
     def __init__(self):
-        self.model_name = os.getenv("GROQ_MODEL") or os.getenv("LLM_MODEL") or "llama-3.3-70b-versatile"
-        self.api_key = os.getenv("GROQ_API_KEY")
-        
-        if self.api_key:
-            try:
-                from groq import Groq
-                self.client = Groq(api_key=self.api_key)
-                self.initialized = True
-                logger.info(f"ChatService initialized with model: {self.model_name}")
-            except ImportError:
-                logger.warning("Groq client not available, using mock responses")
-                self.initialized = False
+        self.model_name = DEFAULT_MODEL
+        self.api_key = DEFAULT_API_KEY
+        self.client, _, self.initialized = get_groq_client()
+        if self.initialized:
+            logger.info(f"ChatService initialized with model: {self.model_name}")
         else:
-            logger.warning("GROQ_API_KEY not set, using mock responses")
-            self.initialized = False
+            logger.warning("GROQ_API_KEY not set or Groq unavailable, using mock responses")
     
     async def stream_chat(
         self,
         messages: List[Dict[str, str]],
         system_prompt: str = None,
         max_tokens: int = 2048,
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        user_system_prompt: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """
         Stream chat response from LLM
@@ -46,8 +53,13 @@ class ChatService:
             temperature: Sampling temperature (0-1)
         """
         
-        if not self.initialized:
-            # Mock response for testing
+        client, model_name, initialized = get_groq_client(
+            user_key=api_key,
+            user_model=model,
+            fallback_client=self.client,
+            fallback_key=self.api_key,
+        )
+        if not initialized:
             yield json.dumps({
                 "type": "content",
                 "content": "Mock LLM response. Configure GROQ_API_KEY to enable real responses."
@@ -55,37 +67,60 @@ class ChatService:
             return
         
         try:
-            # Prepare system prompt
-            if system_prompt:
+            combined_prompt = merge_system_prompt(system_prompt or "", user_system_prompt)
+            if combined_prompt.strip():
                 messages = [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": combined_prompt},
                     *messages
                 ]
-            
-            # Stream from Groq
-            stream = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=True
-            )
-            
+
+            messages = trim_messages_to_budget(messages, reserve_completion=max_tokens)
+            max_out = fit_max_tokens(messages, max_tokens, model=model_name)
+            try:
+                stream = client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    max_tokens=max_out,
+                    temperature=temperature,
+                    stream=True,
+                )
+            except Exception as api_error:
+                limit = parse_max_tokens_limit(api_error)
+                if limit is not None:
+                    stream = client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        max_tokens=min(max_out, limit),
+                        temperature=temperature,
+                        stream=True,
+                    )
+                elif is_payload_too_large_error(api_error):
+                    messages = trim_messages_to_budget(messages, reserve_completion=512)
+                    stream = client.chat.completions.create(
+                        model=model_name,
+                        messages=messages,
+                        max_tokens=fit_max_tokens(messages, 512, model=model_name),
+                        temperature=temperature,
+                        stream=True,
+                    )
+                else:
+                    raise
+
             for chunk in stream:
                 if chunk.choices[0].delta.content:
                     yield json.dumps({
                         "type": "content",
                         "content": chunk.choices[0].delta.content
                     })
-            
+
             # Signal end of stream
             yield json.dumps({"type": "end"})
-            
+
         except Exception as e:
             logger.error(f"Chat stream error: {e}")
             yield json.dumps({
                 "type": "error",
-                "error": str(e)
+                "error": friendly_llm_error(e, model_name if "model_name" in locals() else None),
             })
     
     async def chat_with_context(
@@ -111,7 +146,7 @@ class ChatService:
         system_prompt = self._build_system_prompt(
             repository_context,
             selected_file,
-            selected_code
+            selected_code,
         )
         
         # Build message list
@@ -164,7 +199,8 @@ Use the repository context provided to give accurate, contextual responses.
         
         # Add selected code
         if selected_code:
-            prompt += f"\nSelected code:\n```\n{selected_code}\n```\n"
+            clipped = truncate_text(selected_code, SELECTED_CODE_CHAR_CAP)
+            prompt += f"\nSelected code:\n```\n{clipped}\n```\n"
         
         return prompt
     

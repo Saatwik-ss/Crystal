@@ -20,25 +20,114 @@ class EmbeddingService:
     """
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        try:
-            from sentence_transformers import SentenceTransformer
-            import chromadb
+        self.model_name = model_name
+        self.model = None
+        self.client = None
+        self.collections = {}
+        self.available = False
 
-            self.model = SentenceTransformer(model_name)
+        try:
+            import chromadb
 
             chroma_path = Path("./chroma_db")
             chroma_path.mkdir(parents=True, exist_ok=True)
-
             self.client = chromadb.PersistentClient(path=str(chroma_path))
-            self.collections = {}
+        except Exception as e:
+            logger.error(f"ChromaDB init failed: {e}")
+            return
 
-            logger.info(f"EmbeddingService initialized with model: {model_name}")
+        # #region agent log
+        try:
+            import json as _json
+            import time as _time
+            with open(
+                r"C:\Users\saatw\Downloads\crystal\debug-afc31b.log",
+                "a",
+                encoding="utf-8",
+            ) as _f:
+                _f.write(
+                    _json.dumps(
+                        {
+                            "sessionId": "afc31b",
+                            "runId": "pre-fix",
+                            "hypothesisId": "HF",
+                            "location": "embedding_service.py:__init__",
+                            "message": "loading sentence-transformers model",
+                            "data": {"model_name": model_name},
+                            "timestamp": int(_time.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
 
+        self._load_model(model_name)
+
+    def _load_model(self, model_name: str) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer
         except ImportError as e:
-            logger.error(f"Failed to initialize EmbeddingService: {e}")
-            raise
+            logger.error(f"sentence-transformers not installed: {e}")
+            return
+
+        # Prefer local cache so startup works offline / when HF is flaky
+        try:
+            self.model = SentenceTransformer(model_name, local_files_only=True)
+            self.available = True
+            logger.info(
+                "EmbeddingService loaded model from local cache: %s", model_name
+            )
+            return
+        except Exception as local_err:
+            logger.warning(
+                "Local embedding model cache miss (%s); trying download…", local_err
+            )
+
+        try:
+            self.model = SentenceTransformer(model_name)
+            self.available = True
+            logger.info("EmbeddingService downloaded model: %s", model_name)
+        except Exception as e:
+            logger.error(
+                "Embedding model unavailable (%s). Semantic search disabled; "
+                "chat/agent still work. Fix network to huggingface.co or pre-cache "
+                "all-MiniLM-L6-v2.",
+                e,
+            )
+            self.model = None
+            self.available = False
+            # #region agent log
+            try:
+                import json as _json
+                import time as _time
+                with open(
+                    r"C:\Users\saatw\Downloads\crystal\debug-afc31b.log",
+                    "a",
+                    encoding="utf-8",
+                ) as _f:
+                    _f.write(
+                        _json.dumps(
+                            {
+                                "sessionId": "afc31b",
+                                "runId": "pre-fix",
+                                "hypothesisId": "HF",
+                                "location": "embedding_service.py:_load_model",
+                                "message": "embedding model load failed",
+                                "data": {"error": str(e)[:400], "available": False},
+                                "timestamp": int(_time.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # #endregion
 
     async def embed_text(self, text: str) -> List[float]:
+        if not self.model:
+            return [0.0] * 384
         loop = asyncio.get_event_loop()
         embedding = await loop.run_in_executor(
             None,
@@ -47,6 +136,8 @@ class EmbeddingService:
         return embedding
 
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        if not self.model:
+            return [[0.0] * 384 for _ in texts]
         loop = asyncio.get_event_loop()
         embeddings = await loop.run_in_executor(
             None,
@@ -55,6 +146,8 @@ class EmbeddingService:
         return embeddings
 
     def get_or_create_collection(self, repo_id: str) -> Any:
+        if self.client is None:
+            raise RuntimeError("ChromaDB is not available")
         if repo_id not in self.collections:
             self.collections[repo_id] = self.client.get_or_create_collection(
                 name=f"repo_{repo_id}",
@@ -276,21 +369,6 @@ class EmbeddingService:
                     formatted_results.append(
                         self._expand_with_context(collection, hit)
                     )
-
-            # #region agent log
-            try:
-                from debug_log import debug_log
-                debug_log("A", "embedding_service.py:semantic_search", "search completed", {
-                    "repo_id": repo_id,
-                    "query": query,
-                    "collection_count": collection_count,
-                    "result_count": len(formatted_results),
-                    "top_file_paths": [r.get("file_path") for r in formatted_results[:3]],
-                    "top_symbols": [r.get("symbol_name") for r in formatted_results[:3]],
-                })
-            except Exception:
-                pass
-            # #endregion
 
             return formatted_results
 
