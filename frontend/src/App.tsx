@@ -8,13 +8,16 @@ import Explorer from './components/Explorer';
 import ChatSidebar from './components/ChatSidebar';
 import IndexingStatus from './components/IndexingStatus';
 import NewFileDialog from './components/NewFileDialog';
-import { Menu, FolderPlus, FilePlus } from 'lucide-react';
+import { Menu, FolderPlus, FilePlus, Settings } from 'lucide-react';
+import SettingsDialog from './components/SettingsDialog';
 
 export default function App() {
   const currentRepository = useAppStore((s) => s.currentRepository);
   const handleChatWsMessage = useAppStore((s) => s.handleChatWsMessage);
   const sidebarOpen = useAppStore((s) => s.sidebarOpen);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
+  const settingsOpen = useAppStore((s) => s.settingsOpen);
+  const setSettingsOpen = useAppStore((s) => s.setSettingsOpen);
   const [showUpload, setShowUpload] = useState(false);
   const [showNewFile, setShowNewFile] = useState(false);
 
@@ -86,7 +89,16 @@ export default function App() {
               {currentRepository?.name || 'Local (no repository)'}
             </span>
           </div>
-          <IndexingStatus />
+          <div className="flex items-center gap-2">
+            <IndexingStatus />
+            <button
+              onClick={() => setSettingsOpen(true)}
+              className="p-1 text-gray-300 hover:bg-gray-700 rounded"
+              title="API key and system prompt"
+            >
+              <Settings size={16} />
+            </button>
+          </div>
         </div>
 
         <div className="flex-1 overflow-hidden">
@@ -133,6 +145,7 @@ export default function App() {
       )}
 
       {showNewFile && <NewFileDialog onClose={() => setShowNewFile(false)} />}
+      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }

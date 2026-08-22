@@ -2,7 +2,8 @@ import { useState, useRef, useEffect } from 'react';
 import { useAppStore } from '../store';
 import { apiClient, LOCAL_SESSION_ID } from '../api/client';
 import EditProposalCard from './EditProposalCard';
-import { Send, Trash2, X } from 'lucide-react';
+import AgentProgressPanel from './AgentProgressPanel';
+import { Send, Trash2, X, Settings, ListTodo } from 'lucide-react';
 import clsx from 'clsx';
 
 export default function ChatSidebar() {
@@ -20,6 +21,8 @@ export default function ChatSidebar() {
     activeFile,
     selectedCode,
     openFiles,
+    enablePlanning,
+    setEnablePlanning,
   } = useAppStore();
 
   const [input, setInput] = useState('');
@@ -49,12 +52,13 @@ export default function ChatSidebar() {
     startChatStream();
 
     const activeContent = activeFile ? openFiles.get(activeFile)?.content : undefined;
-    // Prefer full open file for edit proposals; fall back to selection / truncated buffer
+    // Prefer full open file for edit proposals; cap size to stay under Groq TPM limits
+    const CODE_CONTEXT_CAP = 5000;
     const codeContext =
       selectedCode ||
       (activeContent
-        ? activeContent.length > 12000
-          ? activeContent.slice(0, 12000)
+        ? activeContent.length > CODE_CONTEXT_CAP
+          ? activeContent.slice(0, CODE_CONTEXT_CAP)
           : activeContent
         : undefined);
 
@@ -63,7 +67,9 @@ export default function ChatSidebar() {
         currentRepository?.id || LOCAL_SESSION_ID,
         userMessage,
         activeFile || undefined,
-        codeContext
+        codeContext,
+        useAppStore.getState().llmSettings,
+        useAppStore.getState().enablePlanning
       );
     } catch (error) {
       console.error('Failed to send message:', error);
@@ -87,6 +93,13 @@ export default function ChatSidebar() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => useAppStore.getState().setSettingsOpen(true)}
+            className="text-gray-400 hover:text-gray-200 transition-colors"
+            title="API key and system prompt"
+          >
+            <Settings size={16} />
+          </button>
           <button
             onClick={clearChatMessages}
             className="text-gray-400 hover:text-gray-200 transition-colors"
@@ -166,9 +179,33 @@ export default function ChatSidebar() {
         <div ref={messagesEndRef} />
       </div>
 
+      <AgentProgressPanel />
+
       <EditProposalCard />
 
       <div className="p-4 border-t border-gray-700">
+        <div className="flex items-center gap-2 mb-2">
+          <button
+            type="button"
+            onClick={() => setEnablePlanning(!enablePlanning)}
+            disabled={isStreaming}
+            className={clsx(
+              'flex items-center gap-1.5 px-2.5 py-1 rounded text-xs border transition-colors disabled:opacity-50',
+              enablePlanning
+                ? 'bg-blue-600/30 border-blue-500 text-blue-100'
+                : 'bg-gray-700/80 border-gray-600 text-gray-400 hover:text-gray-200'
+            )}
+            title="Off: chat + direct file edits (no plan checklist). On: multi-step agent with plan."
+          >
+            <ListTodo size={14} />
+            Plan
+          </button>
+          {enablePlanning ? (
+            <span className="text-[11px] text-blue-300/80">Agent + plan</span>
+          ) : (
+            <span className="text-[11px] text-gray-500">Chat + edits</span>
+          )}
+        </div>
         <div className="flex gap-2">
           <input
             type="text"

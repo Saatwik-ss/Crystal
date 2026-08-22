@@ -80,13 +80,18 @@ function FileDiff({ edit }: { edit: ProposedEdit }) {
 export default function EditProposalCard() {
   const pendingEdits = useAppStore((s) => s.pendingEdits);
   const lastAppliedRequest = useAppStore((s) => s.lastAppliedRequest);
+  const activeRequestId = useAppStore((s) => s.activeRequestId);
   const editApplying = useAppStore((s) => s.editApplying);
   const applyPendingEdits = useAppStore((s) => s.applyPendingEdits);
   const rejectPendingEdits = useAppStore((s) => s.rejectPendingEdits);
   const undoLastApply = useAppStore((s) => s.undoLastApply);
 
   const showPending = pendingEdits && pendingEdits.length > 0;
-  const showUndo = !showPending && lastAppliedRequest;
+  const alreadyOnDisk =
+    !!showPending &&
+    !!lastAppliedRequest &&
+    lastAppliedRequest.request_id === activeRequestId;
+  const showUndo = (!showPending && lastAppliedRequest) || alreadyOnDisk;
 
   if (!showPending && !showUndo) return null;
 
@@ -98,7 +103,11 @@ export default function EditProposalCard() {
     <div className="mx-4 mb-3 border border-gray-600 rounded-lg bg-gray-800/80 overflow-hidden">
       <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between">
         <h4 className="text-sm font-medium text-white">
-          {showPending ? 'Proposed edits' : 'Last applied'}
+          {alreadyOnDisk
+            ? 'Applied edits'
+            : showPending
+              ? 'Proposed edits'
+              : 'Last applied'}
         </h4>
         {showPending ? (
           <span className="text-[11px] text-gray-400">
@@ -120,7 +129,7 @@ export default function EditProposalCard() {
       )}
 
       <div className="px-3 py-2 border-t border-gray-700 flex items-center gap-2">
-        {showPending ? (
+        {showPending && !alreadyOnDisk ? (
           <>
             <button
               type="button"
@@ -148,15 +157,28 @@ export default function EditProposalCard() {
             </button>
           </>
         ) : (
-          <button
-            type="button"
-            onClick={() => void undoLastApply()}
-            disabled={editApplying}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-amber-700 hover:bg-amber-600 text-white transition-colors disabled:opacity-50"
-          >
-            <Undo2 size={14} />
-            Undo
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={() => void undoLastApply()}
+              disabled={editApplying}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-amber-700 hover:bg-amber-600 text-white transition-colors disabled:opacity-50"
+            >
+              <Undo2 size={14} />
+              Undo
+            </button>
+            {alreadyOnDisk ? (
+              <button
+                type="button"
+                onClick={rejectPendingEdits}
+                disabled={editApplying}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium bg-gray-700 hover:bg-gray-600 text-gray-100 transition-colors disabled:opacity-50"
+              >
+                <X size={14} />
+                Dismiss
+              </button>
+            ) : null}
+          </>
         )}
       </div>
     </div>

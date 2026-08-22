@@ -1,4 +1,4 @@
-import { useRef, useCallback } from 'react';
+import { useRef, useCallback, useEffect } from 'react';
 import { useAppStore } from '../store';
 import EditorTabs from './EditorTabs';
 import MonacoEditor from '@monaco-editor/react';
@@ -8,13 +8,39 @@ import { apiClient, LOCAL_SESSION_ID } from '../api/client';
 import { getMonacoLanguage } from '../utils/language';
 
 const COMPLETION_LANGUAGES = [
-  'python', 'javascript', 'typescript', 'json', 'html', 'css', 'java', 'go', 'rust', 'ruby', 'php', 'c', 'cpp', 'csharp', 'shell', 'markdown', 'yaml', 'xml', 'plaintext', 'sql',
+  'python', 'javascript', 'typescript', 'json', 'html', 'css', 'java', 'go',
+  'rust', 'ruby', 'php', 'c', 'cpp', 'csharp', 'shell', 'markdown', 'yaml',
+  'xml', 'plaintext', 'sql',
 ];
+
+const DEBOUNCE_MS = 280;
+const MIN_PREFIX_CHARS = 2;
+const PREFIX_LINES = 40;
+const SUFFIX_LINES = 15;
 
 let completionRequestId = 0;
 
 interface EditorProps {
   onRequestNewFile?: () => void;
+}
+
+function cleanCompletionText(text: string, prefix: string): string {
+  let cleaned = text.replace(/\r\n/g, '\n').replace(/\r/g, '');
+  cleaned = cleaned.replace(/^```[\w+-]*\n?/, '').replace(/\n?```\s*$/, '');
+  cleaned = cleaned.replace(/<CURSOR>/g, '');
+
+  const lastLine = prefix.includes('\n')
+    ? prefix.slice(prefix.lastIndexOf('\n') + 1)
+    : prefix;
+  if (lastLine && cleaned.startsWith(lastLine)) {
+    cleaned = cleaned.slice(lastLine.length);
+  }
+
+  const lines = cleaned.split('\n');
+  if (lines.length > 12) {
+    cleaned = lines.slice(0, 12).join('\n');
+  }
+  return cleaned;
 }
 
 export default function Editor({ onRequestNewFile }: EditorProps) {
@@ -27,8 +53,8 @@ export default function Editor({ onRequestNewFile }: EditorProps) {
 
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof Monaco | null>(null);
-  const completionProviderRef = useRef<Monaco.IDisposable | null>(null);
   const inlineProviderRef = useRef<Monaco.IDisposable | null>(null);
+  const debounceTimerRef = useRef<number | null>(null);
 
   const currentFile = activeFile ? openFiles.get(activeFile) : null;
   const sessionId = currentRepository?.id || LOCAL_SESSION_ID;
@@ -44,15 +70,29 @@ export default function Editor({ onRequestNewFile }: EditorProps) {
     position: Monaco.Position,
     filePath: string,
     language: string,
+    signal?: AbortSignal,
   ) => {
     const prefix = model.getValueInRange({
-      startLineNumber: Math.max(1, position.lineNumber - 30),
+      startLineNumber: Math.max(1, position.lineNumber - PREFIX_LINES),
       startColumn: 1,
       endLineNumber: position.lineNumber,
       endColumn: position.column,
     });
 
-    if (!prefix.trim()) return null;
+    const suffix = model.getValueInRange({
+      startLineNumber: position.lineNumber,
+      startColumn: position.column,
+      endLineNumber: Math.min(
+        model.getLineCount(),
+        position.lineNumber + SUFFIX_LINES
+      ),
+      endColumn: model.getLineMaxColumn(
+        Math.min(model.getLineCount(), position.lineNumber + SUFFIX_LINES)
+      ),
+    });
+
+    if (prefix.trim().length < MIN_PREFIX_CHARS) return null;
+    if (signal?.aborted) return null;
 
     const requestId = ++completionRequestId;
     try {
@@ -61,14 +101,18 @@ export default function Editor({ onRequestNewFile }: EditorProps) {
         prefix,
         filePath,
         language,
+        useAppStore.getState().llmSettings,
+        suffix,
       );
 
-      if (!text?.trim() || requestId !== completionRequestId) {
+      if (!text?.trim() || requestId !== completionRequestId || signal?.aborted) {
         return null;
       }
 
-      return text.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+      const cleaned = cleanCompletionText(text, prefix);
+      return cleaned.trim() ? cleaned : null;
     } catch (error) {
+      if ((error as Error)?.name === 'AbortError') return null;
       console.error('LLM completion failed:', error);
       return null;
     }
@@ -79,46 +123,41 @@ export default function Editor({ onRequestNewFile }: EditorProps) {
     filePath: string,
     language: string,
   ) => {
-    completionProviderRef.current?.dispose();
     inlineProviderRef.current?.dispose();
 
-    completionProviderRef.current = monaco.languages.registerCompletionItemProvider(language, {
-      triggerCharacters: ['.', '(', '[', '{', ':', ' ', '\n', '"', "'"],
-      provideCompletionItems: async (model, position) => {
-        const completionText = await requestLlmCompletion(model, position, filePath, language);
-        if (!completionText) {
-          return { suggestions: [] };
-        }
+    if (!monaco.languages.registerInlineCompletionsProvider) {
+      return;
+    }
 
-        const word = model.getWordUntilPosition(position);
-        const range = {
-          startLineNumber: position.lineNumber,
-          endLineNumber: position.lineNumber,
-          startColumn: word.startColumn,
-          endColumn: position.column,
-        };
-
-        return {
-          suggestions: [{
-            label: '✨ AI suggestion',
-            kind: monaco.languages.CompletionItemKind.Snippet,
-            insertText: completionText,
-            range,
-            sortText: '0',
-            detail: 'Groq AI completion',
-          }],
-        };
-      },
-    });
-
-    if (monaco.languages.registerInlineCompletionsProvider) {
-      inlineProviderRef.current = monaco.languages.registerInlineCompletionsProvider(language, {
+    inlineProviderRef.current = monaco.languages.registerInlineCompletionsProvider(
+      language,
+      {
         provideInlineCompletions: async (model, position, _context, token) => {
           if (token.isCancellationRequested) {
             return { items: [] };
           }
 
-          const completionText = await requestLlmCompletion(model, position, filePath, language);
+          // Debounce: wait briefly so rapid typing doesn't spam the API
+          await new Promise<void>((resolve) => {
+            if (debounceTimerRef.current != null) {
+              window.clearTimeout(debounceTimerRef.current);
+            }
+            debounceTimerRef.current = window.setTimeout(() => {
+              debounceTimerRef.current = null;
+              resolve();
+            }, DEBOUNCE_MS);
+          });
+
+          if (token.isCancellationRequested) {
+            return { items: [] };
+          }
+
+          const completionText = await requestLlmCompletion(
+            model,
+            position,
+            filePath,
+            language,
+          );
           if (!completionText || token.isCancellationRequested) {
             return { items: [] };
           }
@@ -136,9 +175,18 @@ export default function Editor({ onRequestNewFile }: EditorProps) {
           };
         },
         freeInlineCompletions: () => {},
-      });
-    }
+      }
+    );
   }, [requestLlmCompletion]);
+
+  useEffect(() => {
+    return () => {
+      inlineProviderRef.current?.dispose();
+      if (debounceTimerRef.current != null) {
+        window.clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, []);
 
   const handleEditorMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
@@ -191,13 +239,20 @@ export default function Editor({ onRequestNewFile }: EditorProps) {
               cursorStyle: 'line',
               tabSize: 2,
               insertSpaces: true,
-              quickSuggestions: { other: true, comments: false, strings: true },
+              // Prefer ghost-text inline suggest; keep native word suggest light
+              quickSuggestions: { other: true, comments: false, strings: false },
               suggestOnTriggerCharacters: true,
               acceptSuggestionOnEnter: 'on',
-              inlineSuggest: { enabled: true },
+              tabCompletion: 'on',
+              inlineSuggest: {
+                enabled: true,
+                mode: 'subwordSmart',
+                suppressSuggestions: false,
+              },
               suggest: {
                 preview: true,
                 showIcons: true,
+                snippetsPreventQuickSuggestions: false,
               },
             }}
           />

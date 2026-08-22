@@ -6,6 +6,7 @@ import type {
   RepositoryFile,
   SearchResult,
 } from '../types';
+import { llmPayload, type LlmSettings } from '../utils/llmSettings';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const WS_BASE_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
@@ -152,7 +153,9 @@ class APIClient {
     repoId: string | null | undefined,
     message: string,
     selectedFile?: string,
-    selectedCode?: string
+    selectedCode?: string,
+    settings?: LlmSettings,
+    enablePlanning: boolean = false
   ): Promise<void> {
     const id = sessionId(repoId);
     let ws = this.wsConnections.get(`chat_${id}`);
@@ -170,7 +173,13 @@ class APIClient {
       });
     }
     if (ws.readyState !== WebSocket.OPEN) throw new Error('Chat connection is closed');
-    ws.send(JSON.stringify({ message, selected_file: selectedFile, selected_code: selectedCode }));
+    ws.send(JSON.stringify({
+      message,
+      selected_file: selectedFile,
+      selected_code: selectedCode,
+      enable_planning: enablePlanning,
+      ...(settings ? llmPayload(settings) : {}),
+    }));
   }
 
   // Completion WebSocket
@@ -192,6 +201,8 @@ class APIClient {
         if (this.pendingCompletion) {
           if (message.type === 'completion' && message.text) {
             this.pendingCompletion.buffer += message.text;
+          } else if (message.type === 'completion_final' && typeof message.text === 'string') {
+            this.pendingCompletion.buffer = message.text;
           } else if (message.type === 'end') {
             const text = this.pendingCompletion.buffer;
             const { resolve } = this.pendingCompletion;
@@ -218,6 +229,11 @@ class APIClient {
       if (this.wsConnections.get(key) === ws) {
         this.wsConnections.delete(key);
       }
+      if (this.pendingCompletion) {
+        const { reject } = this.pendingCompletion;
+        this.pendingCompletion = null;
+        reject(new Error('Completion connection closed'));
+      }
     };
 
     this.wsConnections.set(key, ws);
@@ -227,7 +243,9 @@ class APIClient {
     repoId: string | null | undefined,
     prompt: string,
     filePath?: string,
-    language?: string
+    language?: string,
+    settings?: LlmSettings,
+    suffix?: string
   ): Promise<string> {
     const id = sessionId(repoId);
     let ws = this.wsConnections.get(`completion_${id}`);
@@ -247,8 +265,12 @@ class APIClient {
     if (ws.readyState !== WebSocket.OPEN) {
       throw new Error('Completion connection is closed');
     }
+
+    // Newer typing supersedes any in-flight completion
     if (this.pendingCompletion) {
-      throw new Error('Another completion request is in progress');
+      const stale = this.pendingCompletion;
+      this.pendingCompletion = null;
+      stale.resolve(stale.buffer || '');
     }
 
     return new Promise<string>((resolve, reject) => {
@@ -262,7 +284,7 @@ class APIClient {
             reject(new Error('Completion timed out'));
           }
         }
-      }, 12000);
+      }, 10000);
 
       this.pendingCompletion = {
         buffer: '',
@@ -279,8 +301,10 @@ class APIClient {
       ws!.send(
         JSON.stringify({
           prompt,
+          suffix: suffix || '',
           file_path: filePath,
           language: language || 'javascript',
+          ...(settings ? llmPayload(settings) : {}),
         })
       );
     });

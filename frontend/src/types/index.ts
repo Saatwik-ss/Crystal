@@ -85,11 +85,34 @@ export interface ProposedEdit {
   rationale?: string;
   validation: EditValidation;
   is_new_file?: boolean;
+  applied?: boolean;
 }
 
 export interface EditProposal {
   request_id: string;
   edits: ProposedEdit[];
+}
+
+export interface AgentTodo {
+  id: string;
+  title: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'cancelled' | string;
+  note?: string;
+}
+
+export interface AgentPlan {
+  goal: string;
+  todos: AgentTodo[];
+}
+
+export interface TerminalLog {
+  command: string;
+  returncode?: number | null;
+  stdout?: string;
+  stderr?: string;
+  status?: string;
+  error?: string;
+  timestamp: string;
 }
 
 export interface AppliedEditSnapshot {

@@ -7,9 +7,17 @@ import type {
   IndexingStatus,
   ProposedEdit,
   AppliedEditSnapshot,
+  AgentPlan,
+  AgentTodo,
+  TerminalLog,
 } from '../types';
 import { apiClient, LOCAL_SESSION_ID } from '../api/client';
 import { getMonacoLanguage } from '../utils/language';
+import {
+  loadLlmSettings,
+  saveLlmSettings,
+  type LlmSettings,
+} from '../utils/llmSettings';
 
 interface AppStore {
   // Repository state
@@ -42,6 +50,11 @@ interface AppStore {
   streamingContent: string;
   isStreaming: boolean;
   statusLine: string | null;
+  agentPlan: AgentPlan | null;
+  terminalLogs: TerminalLog[];
+  agentStep: string | null;
+  enablePlanning: boolean;
+  setEnablePlanning: (enabled: boolean) => void;
 
   addChatMessage: (message: ChatMessage) => void;
   clearChatMessages: () => void;
@@ -56,6 +69,19 @@ interface AppStore {
     args?: Record<string, unknown>;
     request_id?: string;
     edits?: ProposedEdit[];
+    applied?: boolean;
+    goal?: string;
+    todos?: AgentTodo[];
+    id?: string;
+    status?: string;
+    note?: string;
+    plan?: AgentPlan;
+    command?: string;
+    returncode?: number | null;
+    stdout?: string;
+    stderr?: string;
+    step?: number;
+    max_steps?: number;
   }) => void;
 
   // Edit proposals
@@ -73,6 +99,11 @@ interface AppStore {
 
   toggleSidebar: () => void;
   toggleExplorerNode: (path: string) => void;
+
+  llmSettings: LlmSettings;
+  setLlmSettings: (settings: LlmSettings) => void;
+  settingsOpen: boolean;
+  setSettingsOpen: (open: boolean) => void;
 
   // File explorer state
   expandedFolders: Set<string>;
@@ -241,6 +272,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
   streamingContent: '',
   isStreaming: false,
   statusLine: null,
+  agentPlan: null,
+  terminalLogs: [],
+  agentStep: null,
+  enablePlanning: false,
+  setEnablePlanning: (enabled) => set({ enablePlanning: enabled }),
 
   addChatMessage: (message) =>
     set((state) => ({
@@ -255,6 +291,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
       statusLine: null,
       pendingEdits: null,
       activeRequestId: null,
+      agentPlan: null,
+      terminalLogs: [],
+      agentStep: null,
     }),
 
   setChatLoading: (loading) => set({ chatLoading: loading }),
@@ -262,7 +301,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setChatError: (error) => set({ chatError: error }),
 
   startChatStream: () =>
-    set({ streamingContent: '', isStreaming: true, statusLine: null }),
+    set({
+      streamingContent: '',
+      isStreaming: true,
+      statusLine: null,
+      agentPlan: null,
+      terminalLogs: [],
+      agentStep: null,
+    }),
 
   handleChatWsMessage: (message) =>
     set((state) => {
@@ -287,6 +333,90 @@ export const useAppStore = create<AppStore>((set, get) => ({
         };
       }
 
+      if (message.type === 'step') {
+        const label =
+          message.content ||
+          (message.step != null
+            ? `Step ${message.step}/${message.max_steps ?? '?'}`
+            : 'Working…');
+        return {
+          agentStep: label,
+          statusLine: label,
+          isStreaming: true,
+        };
+      }
+
+      if (message.type === 'plan') {
+        const plan: AgentPlan = {
+          goal: message.goal || '',
+          todos: (message.todos || []).map((t) => ({
+            id: t.id,
+            title: t.title,
+            status: t.status || 'pending',
+            note: t.note,
+          })),
+        };
+        return {
+          agentPlan: plan,
+          statusLine: plan.goal ? `Plan: ${plan.goal}` : 'Plan created',
+          isStreaming: true,
+        };
+      }
+
+      if (message.type === 'todo_update') {
+        const incoming = message.plan;
+        let plan = state.agentPlan;
+        if (incoming?.todos) {
+          plan = {
+            goal: incoming.goal || plan?.goal || '',
+            todos: incoming.todos,
+          };
+        } else if (plan && message.id) {
+          plan = {
+            ...plan,
+            todos: plan.todos.map((t) =>
+              t.id === message.id
+                ? {
+                    ...t,
+                    status: message.status || t.status,
+                    note: message.note ?? t.note,
+                  }
+                : t
+            ),
+          };
+        }
+        const active = plan?.todos.find((t) => t.status === 'in_progress');
+        return {
+          agentPlan: plan,
+          statusLine: active
+            ? `Working: ${active.title}`
+            : message.status
+              ? `Todo ${message.id}: ${message.status}`
+              : state.statusLine,
+          isStreaming: true,
+        };
+      }
+
+      if (message.type === 'terminal') {
+        const entry: TerminalLog = {
+          command: message.command || '',
+          returncode: message.returncode,
+          stdout: message.stdout,
+          stderr: message.stderr,
+          status: message.status,
+          error: message.error,
+          timestamp,
+        };
+        const ok = message.returncode === 0;
+        return {
+          terminalLogs: [...state.terminalLogs.slice(-9), entry],
+          statusLine: ok
+            ? `✓ ${entry.command}`
+            : `✗ ${entry.command} (exit ${message.returncode ?? '?'})`,
+          isStreaming: true,
+        };
+      }
+
       if (message.type === 'tool_call') {
         return {
           statusLine: `Running ${message.tool ?? 'tool'}…`,
@@ -306,13 +436,27 @@ export const useAppStore = create<AppStore>((set, get) => ({
           ...e,
           file_path: (e.file_path || '').replace(/\\/g, '/'),
           validation: e.validation ?? { ok: true, errors: [] },
+          // Keep full content for diff UI — may already be applied on disk
+          original: e.original ?? '',
+          proposed: e.proposed ?? '',
+          diff: e.diff ?? '',
         }));
+        const applied = Boolean(message.applied);
+        const tabUpdates = applied
+          ? applyEditsToOpenTabs(state, edits, true)
+          : {};
         return {
+          ...tabUpdates,
           pendingEdits: edits,
           activeRequestId: message.request_id ?? null,
+          lastAppliedRequest: applied
+            ? { request_id: message.request_id ?? '', edits }
+            : state.lastAppliedRequest,
           isStreaming: true,
           statusLine: edits.length
-            ? `Proposed ${edits.length} edit${edits.length === 1 ? '' : 's'} — review below`
+            ? applied
+              ? `Applied ${edits.length} file${edits.length === 1 ? '' : 's'} — review / undo below`
+              : `Proposed ${edits.length} edit${edits.length === 1 ? '' : 's'} — review below`
             : null,
         };
       }
@@ -517,6 +661,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
       newExpanded.set(path, !(newExpanded.get(path) ?? false));
       return { explorerExpanded: newExpanded };
     }),
+
+  llmSettings: loadLlmSettings(),
+  setLlmSettings: (settings) => {
+    saveLlmSettings(settings);
+    set({ llmSettings: settings });
+  },
+  settingsOpen: false,
+  setSettingsOpen: (open) => set({ settingsOpen: open }),
 
   // File explorer state
   expandedFolders: new Set(),
