@@ -21,6 +21,36 @@ export default function App() {
   const [showUpload, setShowUpload] = useState(false);
   const [showNewFile, setShowNewFile] = useState(false);
 
+  
+  const [leftWidth, setLeftWidth] = useState(256);
+  const [rightWidth, setRightWidth] = useState(384);
+  const [isDraggingLeft, setIsDraggingLeft] = useState(false);
+  const [isDraggingRight, setIsDraggingRight] = useState(false);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (isDraggingLeft) {
+        setLeftWidth(Math.max(150, Math.min(e.clientX, 600)));
+      }
+      if (isDraggingRight) {
+        setRightWidth(Math.max(250, Math.min(window.innerWidth - e.clientX, 800)));
+      }
+    };
+    const handleMouseUp = () => { document.body.style.userSelect = '';
+      setIsDraggingLeft(false);
+      setIsDraggingRight(false);
+    };
+
+    if (isDraggingLeft || isDraggingRight) { document.body.style.userSelect = 'none';
+      document.addEventListener('mousemove', handleMouseMove);
+      document.addEventListener('mouseup', handleMouseUp);
+    }
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDraggingLeft, isDraggingRight]);
+
   useRepositoryIndexing();
 
   useEffect(() => {
@@ -57,7 +87,7 @@ export default function App() {
   return (
     <div className="flex h-screen bg-gray-900 text-gray-100">
       {/* Explorer Sidebar */}
-      <div className="w-64 bg-gray-800 border-r border-gray-700 flex flex-col overflow-hidden">
+      <div className="bg-gray-800 border-r border-gray-700 flex flex-col overflow-hidden relative shrink-0" style={{ width: leftWidth }}>
         <div className="p-4 border-b border-gray-700 flex items-center justify-between">
           <h2 className="font-semibold text-sm">Explorer</h2>
           <div className="flex gap-1">
@@ -78,6 +108,10 @@ export default function App() {
           </div>
         </div>
         <Explorer />
+        <div
+          className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-500 z-10"
+          onMouseDown={() => setIsDraggingLeft(true)}
+        />
       </div>
 
       {/* Editor Area */}
@@ -107,7 +141,11 @@ export default function App() {
       </div>
 
       {sidebarOpen && (
-        <div className="w-96 bg-gray-800 border-l border-gray-700 flex flex-col overflow-hidden">
+        <div className="bg-gray-800 border-l border-gray-700 flex flex-col overflow-hidden relative shrink-0" style={{ width: rightWidth }}>
+          <div
+            className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-blue-500 z-10"
+            onMouseDown={() => setIsDraggingRight(true)}
+          />
           <ChatSidebar />
         </div>
       )}

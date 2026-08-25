@@ -265,7 +265,66 @@ def is_tool_use_failed_error(error: Any) -> bool:
         or "failed to call a function" in text
         or "invalid tool call" in text
         or "tool choice is required" in text
+        or "tool choice is none" in text
+        or "tool_choice is none" in text
+        or "model called a tool" in text
+        or "output_parse_failed" in text
+        or "tools should have a name" in text
+        or "failed to render tokens with harmony" in text
     )
+
+
+def sanitize_messages_for_chat(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Prepare messages for direct chat completion where tools are not active.
+    1. Removes tool-specific instructions from system prompts.
+    2. Appends an explicit directive instructing the model to reply in plain markdown text.
+    3. Transforms assistant tool_calls and tool-role result messages into plain text summaries.
+    """
+    clean_messages: List[Dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+
+        if role == "system":
+            text = content or ""
+            # Strip tool-specific directives if present
+            text = re.sub(
+                r"For code changes \(edit current file or create a new file\):.*?(Keep changes minimal|$)",
+                "",
+                text,
+                flags=re.DOTALL,
+            )
+            text = re.sub(r"1\.\s*Prefer apply_patch.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
+            text = re.sub(r"2\.\s*Use propose_edit.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
+            text = re.sub(r"3\.\s*Call finish.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
+            text = re.sub(r"4\.\s*Do NOT call create_plan.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
+            text = text.strip()
+
+            chat_directive = (
+                "\n\nIMPORTANT: You are in direct chat mode without tool execution capabilities. "
+                "Provide all answers and code snippets directly as standard markdown text or code blocks. "
+                "Do NOT attempt to call tools, invoke functions, or output tool call tags (e.g. <tool_call>, <function=...>, or JSON schemas)."
+            )
+            clean_messages.append({"role": "system", "content": (text + chat_directive).strip()})
+        elif role == "assistant":
+            if tool_calls and not content:
+                call_summaries = []
+                for tc in tool_calls:
+                    fn = tc.get("function") or {}
+                    call_summaries.append(f"[Called tool {fn.get('name', 'unknown')}]")
+                clean_messages.append({"role": "assistant", "content": " ".join(call_summaries)})
+            else:
+                clean_messages.append({"role": "assistant", "content": content or ""})
+        elif role == "tool":
+            clean_messages.append({
+                "role": "user",
+                "content": f"[Tool execution result]: {content or ''}",
+            })
+        else:
+            clean_messages.append(dict(msg))
+    return clean_messages
 
 
 def extract_failed_generation(error: Any) -> Optional[str]:
@@ -364,6 +423,12 @@ def parse_max_tokens_limit(error: Any) -> Optional[int]:
 
 
 def friendly_llm_error(error: Any, model: Optional[str] = None) -> str:
+    text = str(error).lower()
+    if "tool choice is none" in text or "tool_choice is none" in text or "model called a tool" in text:
+        return (
+            f"The model attempted to format a tool call when tools were disabled. "
+            "Please retry or switch to an agent-capable model."
+        )
     if is_unsupported_chat_model_error(error):
         return (
             f"Model `{model or 'selected'}` does not support chat. "

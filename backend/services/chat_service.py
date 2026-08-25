@@ -6,12 +6,15 @@ from services.llm_config import (
     DEFAULT_API_KEY,
     DEFAULT_MODEL,
     SELECTED_CODE_CHAR_CAP,
+    extract_failed_generation,
     fit_max_tokens,
     friendly_llm_error,
     get_groq_client,
     is_payload_too_large_error,
+    is_tool_use_failed_error,
     merge_system_prompt,
     parse_max_tokens_limit,
+    sanitize_messages_for_chat,
     trim_messages_to_budget,
     truncate_text,
 )
@@ -74,6 +77,7 @@ class ChatService:
                     *messages
                 ]
 
+            messages = sanitize_messages_for_chat(messages)
             messages = trim_messages_to_budget(messages, reserve_completion=max_tokens)
             max_out = fit_max_tokens(messages, max_tokens, model=model_name)
             try:
@@ -85,6 +89,15 @@ class ChatService:
                     stream=True,
                 )
             except Exception as api_error:
+                if is_tool_use_failed_error(api_error):
+                    fg = extract_failed_generation(api_error)
+                    if fg:
+                        yield json.dumps({
+                            "type": "content",
+                            "content": fg
+                        })
+                        yield json.dumps({"type": "end"})
+                        return
                 limit = parse_max_tokens_limit(api_error)
                 if limit is not None:
                     stream = client.chat.completions.create(
@@ -117,6 +130,15 @@ class ChatService:
             yield json.dumps({"type": "end"})
 
         except Exception as e:
+            if is_tool_use_failed_error(e):
+                fg = extract_failed_generation(e)
+                if fg:
+                    yield json.dumps({
+                        "type": "content",
+                        "content": fg
+                    })
+                    yield json.dumps({"type": "end"})
+                    return
             logger.error(f"Chat stream error: {e}")
             yield json.dumps({
                 "type": "error",

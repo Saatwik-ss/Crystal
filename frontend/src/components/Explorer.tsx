@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '../store';
 import { apiClient } from '../api/client';
-import { ChevronRight, ChevronDown, File, Folder } from 'lucide-react';
+import { ChevronRight, ChevronDown, File, Folder, Download } from 'lucide-react';
 import { getMonacoLanguage, normalizePath } from '../utils/language';
 
 interface FileTree {
@@ -60,6 +60,36 @@ export default function Explorer() {
 
     setFileTree(tree);
   }, [repositoryFiles]);
+
+  
+  const handleDownload = async (e: React.MouseEvent, filePath: string) => {
+    e.stopPropagation();
+    
+    // Check openFiles or localFiles first
+    let content = openFiles.get(filePath)?.content || localFiles.find((f) => f.path === filePath)?.content;
+    
+    // If not local, try fetching from repo
+    if (content === undefined && currentRepository?.id) {
+      try {
+        content = await apiClient.readFile(currentRepository.id, filePath);
+      } catch (err) {
+        console.error("Download failed:", err);
+        return;
+      }
+    }
+    
+    if (content !== undefined) {
+      const blob = new Blob([content], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filePath.split('/').pop() || 'download';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  };
 
   const handleLocalFileClick = (path: string) => {
     const file = localFiles.find((f) => f.path === path) || openFiles.get(path);
@@ -186,8 +216,19 @@ export default function Explorer() {
                 <Folder size={14} className="text-blue-400" />
               )}
 
+              
               <span className="flex-1 truncate">{key}</span>
+              {isFile && (
+                <button
+                  onClick={(e) => handleDownload(e, fullPath)}
+                  className="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-white"
+                  title="Download file"
+                >
+                  <Download size={14} />
+                </button>
+              )}
             </div>
+
 
             {!isFile && isExpanded && (
               <div className="pl-4">
@@ -234,8 +275,17 @@ export default function Explorer() {
                 onClick={() => handleLocalFileClick(file.path)}
               >
                 <File size={14} className="text-emerald-400" />
+                
                 <span className="flex-1 truncate">{file.path}</span>
+                <button
+                  onClick={(e) => handleDownload(e, file.path)}
+                  className="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-white"
+                  title="Download file"
+                >
+                  <Download size={14} />
+                </button>
               </div>
+
             ))}
           </div>
         )}

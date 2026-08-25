@@ -26,6 +26,7 @@ from services.llm_config import (
     merge_system_prompt,
     normalize_tool_args,
     parse_max_tokens_limit,
+    sanitize_messages_for_chat,
     supports_tools,
     trim_messages_to_budget,
     truncate_text,
@@ -58,8 +59,9 @@ DIRECT_REPO_TOOLS = AGENT_TOOL_NAMES - PLANNING_TOOLS
 DIRECT_MAX_STEPS = 6
 
 IMPL_HINTS = re.compile(
-    r"\b(implement|refactor|fix|add|create|update|change|rewrite|migrate|"
-    r"debug|build|write|patch|edit|remove|delete|rename|test)\b",
+    r"\b(make|create|implement|build|code|write|generate|develop|author|produce|"
+    r"refactor|fix|add|update|change|rewrite|migrate|debug|patch|edit|remove|"
+    r"delete|rename|test|script|program|app|module|function|class|file|calculator|readme)\b",
     re.IGNORECASE,
 )
 
@@ -125,22 +127,6 @@ class AgentPlanner:
         proposed_edits: List[Dict[str, Any]] = []
 
         try:
-            if enable_planning:
-                base_prompt = self._build_agent_system_prompt(
-                    context, selected_file, selected_code
-                )
-            else:
-                base_prompt = self._build_chat_system_prompt(
-                    context, selected_file, selected_code
-                )
-            system_prompt = merge_system_prompt(base_prompt, user_system_prompt)
-
-            messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                *conversation_history,
-                {"role": "user", "content": message},
-            ]
-
             has_repo = repo_id not in ("local", "none", "__none__", None, "")
             has_indexed_files = bool((context or {}).get("total_files"))
             local_edit_mode = (not has_indexed_files) and bool(selected_file)
@@ -156,6 +142,26 @@ class AgentPlanner:
                     or (local_session and wants_impl)
                 )
             )
+
+            if not use_tools:
+                base_prompt = self._build_direct_chat_system_prompt(
+                    context, selected_file, selected_code
+                )
+            elif enable_planning:
+                base_prompt = self._build_agent_system_prompt(
+                    context, selected_file, selected_code
+                )
+            else:
+                base_prompt = self._build_chat_system_prompt(
+                    context, selected_file, selected_code
+                )
+            system_prompt = merge_system_prompt(base_prompt, user_system_prompt)
+
+            messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                *conversation_history,
+                {"role": "user", "content": message},
+            ]
 
             if not initialized:
                 yield {
@@ -305,11 +311,6 @@ class AgentPlanner:
                     if recovered:
                         tool_name, tool_args = recovered
                         tool_args = normalize_tool_args(tool_name, tool_args)
-                        # Groq's Harmony formatter requires every tool result
-                        # to follow an assistant message that declares the tool
-                        # call. Recovered calls originate from a rejected API
-                        # request, so add that missing transcript entry before
-                        # _run_single_tool appends the result.
                         messages.append({
                             "role": "assistant",
                             "content": None,
@@ -488,7 +489,6 @@ class AgentPlanner:
             session_info = self.tool_executor.end_session()
 
             if proposed_edits:
-                # Prefer first-before / last-after when same file patched multiple times
                 by_path: Dict[str, Dict[str, Any]] = {}
                 for edit in proposed_edits:
                     path = edit.get("file_path") or ""
@@ -535,7 +535,7 @@ class AgentPlanner:
                 self.tool_executor.end_session()
             except Exception:
                 pass
-            if "tool_use_failed" in str(e).lower() or is_tools_not_supported_error(e):
+            if "tool_use_failed" in str(e).lower() or is_tools_not_supported_error(e) or is_tool_use_failed_error(e):
                 async for event in self._fallback_chat_response(
                     messages if "messages" in locals() else [
                         {"role": "user", "content": message or ""}
@@ -619,7 +619,6 @@ class AgentPlanner:
         if tool_name == "finish" and isinstance(payload, dict) and payload.get("summary"):
             yield {"type": "message", "content": payload["summary"]}
 
-        # Compact result for the model context
         tool_content = self._compact_tool_result(tool_name, result)
         messages.append({
             "role": "tool",
@@ -664,7 +663,6 @@ class AgentPlanner:
             return truncate_text(str(data), TOOL_RESULT_CHAR_CAP)
 
     def _public_tool_result(self, tool_name: str, result: Dict[str, Any]) -> Any:
-        """UI-facing result without huge file bodies."""
         if result.get("status") != "success":
             return result
         data = result.get("result")
@@ -687,7 +685,6 @@ class AgentPlanner:
         selected_file: Optional[str],
         selected_code: Optional[str],
     ) -> Dict[str, Any]:
-        """Fill original from editor buffer when disk file is missing (local)."""
         if not edit:
             return edit
         original = edit.get("original") or ""
@@ -728,6 +725,27 @@ class AgentPlanner:
             if not blob:
                 continue
 
+            # 1. Check for XML tool_call tags: <tool_call>...</tool_call>
+            tc_match = re.search(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", blob, re.DOTALL)
+            if tc_match:
+                inner = tc_match.group(1).strip()
+                try:
+                    parsed = json.loads(inner)
+                    if isinstance(parsed, dict):
+                        tool_name = parsed.get("name") or parsed.get("tool") or ""
+                        raw_args = parsed.get("arguments") or parsed.get("parameters") or {}
+                        if tool_name in AGENT_TOOL_NAMES:
+                            if isinstance(raw_args, str):
+                                try:
+                                    raw_args = json.loads(raw_args)
+                                except json.JSONDecodeError:
+                                    raw_args = {}
+                            if isinstance(raw_args, dict):
+                                return tool_name, normalize_tool_args(tool_name, raw_args)
+                except Exception:
+                    pass
+
+            # 2. Check for <function=name>{args}</function>
             tool_match = re.search(r"<function=(\w+)\s*>?\s*", blob)
             if tool_match:
                 tool_name = tool_match.group(1)
@@ -743,6 +761,7 @@ class AgentPlanner:
                             tool_name,
                         )
 
+            # 3. Direct JSON parsing
             try:
                 parsed = json.loads(blob) if blob.strip().startswith("{") else None
             except json.JSONDecodeError:
@@ -759,6 +778,26 @@ class AgentPlanner:
                     if isinstance(raw_args, dict):
                         return tool_name, normalize_tool_args(tool_name, raw_args)
 
+            # 4. Search for any JSON object containing tool name in blob
+            for match_obj in re.finditer(r'\{\s*"name"\s*:\s*"(\w+)"', blob):
+                potential_name = match_obj.group(1)
+                if potential_name in AGENT_TOOL_NAMES:
+                    start_pos = match_obj.start()
+                    try:
+                        obj, _ = json.JSONDecoder().raw_decode(blob[start_pos:])
+                        if isinstance(obj, dict):
+                            raw_args = obj.get("arguments") or obj.get("parameters") or {}
+                            if isinstance(raw_args, str):
+                                try:
+                                    raw_args = json.loads(raw_args)
+                                except json.JSONDecodeError:
+                                    raw_args = {}
+                            if isinstance(raw_args, dict):
+                                return potential_name, normalize_tool_args(potential_name, raw_args)
+                    except Exception:
+                        pass
+
+            # 5. Bare function call: read_file(...)
             bare = re.search(
                 r"\b("
                 + "|".join(
@@ -814,8 +853,9 @@ class AgentPlanner:
 
         llm = client or self.client
         model = model_name or self.model_name
+        sanitized = sanitize_messages_for_chat(messages)
         safe_messages = trim_messages_to_budget(
-            messages, reserve_completion=CHAT_MAX_TOKENS
+            sanitized, reserve_completion=CHAT_MAX_TOKENS
         )
         max_out = fit_max_tokens(safe_messages, CHAT_MAX_TOKENS, model=model)
 
@@ -828,6 +868,31 @@ class AgentPlanner:
                 temperature=0.2,
             )
         except Exception as api_error:
+            if is_tool_use_failed_error(api_error):
+                fg = extract_failed_generation(api_error)
+                if fg:
+                    clean_fg = re.sub(r"^<tool_call>\s*", "", fg, flags=re.IGNORECASE)
+                    clean_fg = re.sub(r"\s*</tool_call>$", "", clean_fg, flags=re.IGNORECASE)
+                    try:
+                        parsed_json = json.loads(clean_fg)
+                        if isinstance(parsed_json, dict) and ("name" in parsed_json or "arguments" in parsed_json):
+                            args = parsed_json.get("arguments") or {}
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except Exception:
+                                    pass
+                            content_val = args.get("new_content") or args.get("content") or clean_fg
+                            yield {"type": "content", "content": str(content_val)}
+                            if end:
+                                yield {"type": "end"}
+                            return
+                    except Exception:
+                        pass
+                    yield {"type": "content", "content": clean_fg}
+                    if end:
+                        yield {"type": "end"}
+                    return
             limit = parse_max_tokens_limit(api_error)
             if limit is not None:
                 try:
@@ -920,6 +985,21 @@ class AgentPlanner:
 
         return prompt
 
+    def _build_direct_chat_system_prompt(
+        self,
+        repository_context: Dict[str, Any] = None,
+        selected_file: str = None,
+        selected_code: str = None,
+    ) -> str:
+        """Pure chat response without any tool directives."""
+        prompt = """You are an expert AI coding assistant.
+Answer questions and provide solutions directly in chat with clear explanations and code blocks.
+Do NOT attempt to call tools, invoke functions, or output tool call tags (e.g. <tool_call>, <function=...>, or JSON schemas).
+"""
+        return self._append_context(
+            prompt, repository_context, selected_file, selected_code
+        )
+
     def _build_chat_system_prompt(
         self,
         repository_context: Dict[str, Any] = None,
@@ -929,15 +1009,14 @@ class AgentPlanner:
         """Direct chat + edits — no formal plan / step checklist."""
         prompt = """You are an expert AI coding assistant.
 
-For questions: answer clearly in chat. Do not invent a multi-step plan.
+For code requests (e.g. creating a new file, program, script, feature, or editing existing code):
+1. ALWAYS create new files using propose_edit with full new_content (e.g. calculator.py, README.md). Include complete, working code and thorough docstrings/comments.
+2. For existing files, prefer apply_patch for surgical edits (exact unique old_string → new_string).
+3. Do NOT dump full code blocks or entire files into the chat message when creating or editing files with tools. The user expects code in new/edited files in their editor.
+4. Call finish with a concise summary once all edits/new files are proposed.
+5. Do NOT call create_plan or update_todo in direct edit mode.
 
-For code changes (edit current file or create a new file):
-1. Prefer apply_patch for surgical edits to an existing file (exact unique old_string → new_string).
-2. Use propose_edit with full new_content for new files or small full-file rewrites.
-3. Call finish with a brief summary when edits are done.
-4. Do NOT call create_plan or update_todo.
-
-Keep changes minimal and correct. Do not dump huge code blocks in chat when a tool edit was applied.
+For purely conceptual or informational questions with no file creation: answer clearly in chat.
 """
         return self._append_context(
             prompt, repository_context, selected_file, selected_code
@@ -957,7 +1036,7 @@ Workflow (follow this for non-trivial work):
 1. Explore with search_repository / read_file / list_files / ast_lookup / find_references. Never guess file contents.
 2. Call create_plan with a clear goal and ordered steps for multi-file or non-trivial changes.
 3. Work one step at a time. Call update_todo as you start/finish each step.
-4. Prefer apply_patch (exact unique old_string → new_string) for existing files. Use propose_edit only for new or tiny files (full file content).
+4. For new files or scripts, use propose_edit with full new_content. Prefer apply_patch (exact unique old_string → new_string) for existing files.
 5. After edits, verify with run_terminal when a test/lint command is obvious (pytest, npm test, tsc, eslint, ruff, mypy, etc.). Fix failures before finishing.
 6. Call finish with a short summary when done. Do NOT dump large code samples in chat.
 
@@ -970,11 +1049,12 @@ CRITICAL RULES:
         else:
             prompt = """You are an expert AI coding assistant.
 
-For code changes on the open file:
+For code changes or creating new files:
 1. Call create_plan for multi-step work, then update_todo as you go.
-2. Prefer apply_patch for surgical edits; use propose_edit for full-file rewrites of small/new files.
-3. You may run_terminal for quick checks when useful.
-4. Call finish with a brief overview when done. Do not paste huge code blocks in chat.
+2. For new files or scripts (e.g. calculator.py, README.md), ALWAYS use propose_edit with full new_content.
+3. Prefer apply_patch for surgical edits to existing files.
+4. You may run_terminal for quick checks when useful.
+5. Call finish with a brief overview when done. Do NOT paste huge code blocks in chat.
 
 For questions only, answer clearly without tools.
 """

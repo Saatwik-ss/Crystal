@@ -207,8 +207,7 @@ export default function ChatSidebar() {
           )}
         </div>
         <div className="flex gap-2">
-          <input
-            type="text"
+          <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -219,7 +218,8 @@ export default function ChatSidebar() {
             }}
             placeholder="Ask about your code..."
             disabled={isStreaming}
-            className="flex-1 bg-gray-700 text-white placeholder-gray-500 px-3 py-2 rounded border border-gray-600 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+            rows={1}
+            className="flex-1 bg-gray-700 text-white placeholder-gray-500 px-3 py-2 rounded border border-gray-600 focus:border-blue-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed resize-y min-h-[40px] max-h-[50vh]"
           />
           <button
             onClick={handleSendMessage}

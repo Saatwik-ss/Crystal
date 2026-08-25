@@ -8,7 +8,7 @@ import type {
 } from '../types';
 import { llmPayload, type LlmSettings } from '../utils/llmSettings';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 const WS_BASE_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
 
 /** Session id used when no repository is uploaded */
@@ -311,7 +311,23 @@ class APIClient {
   }
 
   // Search
+
+  async fetchModels(apiKey: string): Promise<string[]> {
+    const response = await fetch(`${API_BASE_URL}/api/models`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: apiKey }),
+    });
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Failed to fetch models');
+    }
+    const data = await response.json();
+    return data.data.map((m: any) => m.id);
+  }
+
   async search(
+
     repoId: string,
     query: string,
     searchType: 'semantic' | 'keyword' | 'hybrid' = 'semantic',

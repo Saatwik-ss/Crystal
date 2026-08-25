@@ -223,7 +223,9 @@ class ToolExecutor:
             "read_file",
             "Read file content from repository",
             {
-                "file_path": {"type": "string", "description": "Path to file"}
+                "file_path": {"type": "string", "description": "Path to file"},
+                "line_start": {"type": "integer", "description": "Optional start line", "default": 1},
+                "line_end": {"type": "integer", "description": "Optional end line", "default": -1}
             },
             self._read_file
         )
@@ -471,7 +473,8 @@ class ToolExecutor:
         repo_id: str,
         query: str,
         search_type: str = "semantic",
-        top_k: int = 5
+        top_k: int = 5,
+        **kwargs
     ) -> List[Dict[str, Any]]:
         """Search repository"""
         return await self.search_service.search_repository(
@@ -482,20 +485,34 @@ class ToolExecutor:
         self,
         repo_id: str,
         query: str,
-        top_k: int = 5
+        top_k: int = 5,
+        **kwargs
     ) -> List[Dict[str, Any]]:
         """Semantic search"""
         return await self.search_service._semantic_search(repo_id, query, top_k)
     
-    async def _read_file(self, repo_id: str, file_path: str) -> str:
+    async def _read_file(self, repo_id: str, file_path: str, **kwargs) -> str:
         """Read file"""
-        return await self._resolve_file_content(repo_id, file_path)
+        content = await self._resolve_file_content(repo_id, file_path)
+        
+        # Optionally handle line_start and line_end
+        line_start = kwargs.get('line_start')
+        line_end = kwargs.get('line_end')
+        
+        if line_start is not None or line_end is not None:
+            lines = content.splitlines(keepends=True)
+            start_idx = max(0, int(line_start) - 1) if line_start is not None else 0
+            end_idx = int(line_end) if line_end is not None and int(line_end) > 0 else len(lines)
+            return "".join(lines[start_idx:end_idx])
+            
+        return content
     
     async def _write_file(
         self,
         repo_id: str,
         file_path: str,
-        content: str
+        content: str,
+        **kwargs
     ) -> Dict[str, Any]:
         """Write file"""
         return await self.repository_manager.write_file(repo_id, file_path, content)
@@ -576,6 +593,7 @@ class ToolExecutor:
         file_path: str,
         new_content: str,
         rationale: str = "",
+        **kwargs
     ) -> Dict[str, Any]:
         """Propose a full-file edit; soft-apply during agent sessions when enabled."""
         import difflib
@@ -626,6 +644,7 @@ class ToolExecutor:
         old_string: str,
         new_string: str,
         rationale: str = "",
+        **kwargs
     ) -> Dict[str, Any]:
         """Apply unique search/replace and optionally soft-write."""
         import difflib
@@ -734,6 +753,7 @@ class ToolExecutor:
         id: str,
         status: str,
         note: str = "",
+        **kwargs
     ) -> Dict[str, Any]:
         if not self.session_plan:
             self.session_plan = {"goal": "", "todos": []}
@@ -761,13 +781,13 @@ class ToolExecutor:
             "plan": self.session_plan,
         }
 
-    async def _run_terminal(self, repo_id: str, command: str) -> Dict[str, Any]:
+    async def _run_terminal(self, repo_id: str, command: str, **kwargs) -> Dict[str, Any]:
         return await self._execute_terminal(repo_id, command)
 
-    async def _finish(self, repo_id: str, summary: str = "") -> Dict[str, Any]:
+    async def _finish(self, repo_id: str, summary: str = "", **kwargs) -> Dict[str, Any]:
         return {"done": True, "summary": summary or ""}
 
-    async def _list_files(self, repo_id: str) -> List[Dict[str, Any]]:
+    async def _list_files(self, repo_id: str, **kwargs) -> List[Dict[str, Any]]:
         """List files"""
         return await self.repository_manager.list_files(repo_id)
     
@@ -775,7 +795,8 @@ class ToolExecutor:
         self,
         repo_id: str,
         symbol: str,
-        file_path: str
+        file_path: str,
+        **kwargs
     ) -> Optional[Dict[str, Any]]:
         """Look up symbol in AST"""
         content = await self.repository_manager.read_file(repo_id, file_path)
@@ -790,7 +811,8 @@ class ToolExecutor:
         self,
         repo_id: str,
         symbol: str,
-        file_path: str
+        file_path: str,
+        **kwargs
     ) -> List[Dict[str, Any]]:
         """Find references"""
         content = await self.repository_manager.read_file(repo_id, file_path)
@@ -815,7 +837,7 @@ class ToolExecutor:
         asyncio.create_task(self.repository_manager.index_repository(repo_id))
         return {"status": "reindexing_started"}
     
-    async def _execute_terminal(self, repo_id: str, command: str) -> Dict[str, Any]:
+    async def _execute_terminal(self, repo_id: str, command: str, **kwargs) -> Dict[str, Any]:
         """Execute allowlisted terminal command in the repo directory."""
         import subprocess
 

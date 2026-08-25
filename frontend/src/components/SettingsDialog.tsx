@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useAppStore } from '../store';
+import { apiClient } from '../api/client';
 import {
-  CHAT_MODEL_OPTIONS,
   DEFAULT_LLM_SETTINGS,
   type LlmSettings,
 } from '../utils/llmSettings';
@@ -15,6 +15,35 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
   const setLlmSettings = useAppStore((s) => s.setLlmSettings);
   const [draft, setDraft] = useState<LlmSettings>(llmSettings);
   const [saved, setSaved] = useState(false);
+  const [availableModels, setAvailableModels] = useState<string[]>([
+    "llama-3.1-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+    "gemma-7b-it"
+  ]);
+  
+  
+
+  useEffect(() => {
+    async function fetchModels() {
+      if (!draft.apiKey.trim()) return;
+      
+      
+      try {
+        const models = await apiClient.fetchModels(draft.apiKey.trim());
+        setAvailableModels(models);
+      } catch (e: any) {
+        console.error(e);
+      } finally {
+        
+      }
+    }
+    const timeout = setTimeout(fetchModels, 1000);
+    return () => clearTimeout(timeout);
+  }, [draft.apiKey]);
 
   useEffect(() => {
     setDraft(llmSettings);
@@ -37,7 +66,7 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
   const usingDefaults =
     !draft.apiKey.trim() && !draft.model.trim() && !draft.systemPrompt.trim();
 
-  const knownModel = CHAT_MODEL_OPTIONS.some((m) => m === draft.model.trim());
+  const knownModel = availableModels.some((m) => m === draft.model.trim());
   const modelSelectValue = !draft.model.trim()
     ? ''
     : knownModel
@@ -90,7 +119,7 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
           className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 focus:border-blue-500 focus:outline-none mb-2"
         >
           <option value="">Server default</option>
-          {CHAT_MODEL_OPTIONS.map((id) => (
+          {availableModels.map((id) => (
             <option key={id} value={id}>
               {id}
             </option>

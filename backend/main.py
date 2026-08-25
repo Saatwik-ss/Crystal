@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import asyncio
+import httpx
 from typing import Optional, List
 
 from services.repository_manager import RepositoryManager
@@ -111,7 +112,31 @@ app.include_router(chat_routes.router)
 app.include_router(search_routes.router)
 app.include_router(completion_routes.router)
 
+class ModelsRequest(BaseModel):
+    api_key: str
+
+@app.post("/api/models")
+async def get_models(body: ModelsRequest):
+    api_key = body.api_key.strip()
+    if not api_key:
+        api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No API key provided")
+        
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10.0
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
 @app.get("/health")
+
 async def health():
     """Health check endpoint"""
     return {"status": "healthy"}
