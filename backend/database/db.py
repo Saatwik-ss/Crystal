@@ -53,8 +53,7 @@ async def get_db() -> AsyncSession:
     if async_session_maker is None:
         raise RuntimeError("Database not initialized. Call init_db() first")
     
-    async with async_session_maker() as session:
-        return session
+    return async_session_maker()
 
 async def close_db():
     """Close database connection"""
