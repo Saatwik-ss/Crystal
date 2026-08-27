@@ -10,15 +10,15 @@ DEFAULT_API_KEY = os.getenv("GROQ_API_KEY") or ""
 
 # Groq free/dev tiers often reject requests when (prompt + max_tokens) exceeds TPM.
 # 413 "Payload Too Large" / "Request Entity Too Large" is commonly this budget.
-REQUEST_TOKEN_BUDGET = int(os.getenv("GROQ_REQUEST_TOKEN_BUDGET") or "8000")
-TOOL_MAX_TOKENS = int(os.getenv("GROQ_TOOL_MAX_TOKENS") or "2048")
+REQUEST_TOKEN_BUDGET = int(os.getenv("GROQ_REQUEST_TOKEN_BUDGET") or "64000")
+TOOL_MAX_TOKENS = int(os.getenv("GROQ_TOOL_MAX_TOKENS") or "4096")
 # propose_edit must emit full file content in tool args — needs more room.
-EDIT_TOOL_MAX_TOKENS = int(os.getenv("GROQ_EDIT_TOOL_MAX_TOKENS") or "6144")
-CHAT_MAX_TOKENS = int(os.getenv("GROQ_CHAT_MAX_TOKENS") or "2048")
+EDIT_TOOL_MAX_TOKENS = int(os.getenv("GROQ_EDIT_TOOL_MAX_TOKENS") or "16384")
+CHAT_MAX_TOKENS = int(os.getenv("GROQ_CHAT_MAX_TOKENS") or "4096")
 # Keep file context modest so tool-call requests stay under TPM.
-SELECTED_CODE_CHAR_CAP = int(os.getenv("GROQ_SELECTED_CODE_CHAR_CAP") or "4000")
+SELECTED_CODE_CHAR_CAP = int(os.getenv("GROQ_SELECTED_CODE_CHAR_CAP") or "8000")
 MAX_AGENT_STEPS = int(os.getenv("GROQ_MAX_AGENT_STEPS") or "12")
-TOOL_RESULT_CHAR_CAP = int(os.getenv("GROQ_TOOL_RESULT_CHAR_CAP") or "6000")
+TOOL_RESULT_CHAR_CAP = int(os.getenv("GROQ_TOOL_RESULT_CHAR_CAP") or "16000")
 
 # Models that are chat/completions-capable (used for settings + validation).
 CHAT_MODEL_CHOICES: List[str] = [

@@ -398,10 +398,12 @@ class AgentPlanner:
                         messages.append({
                             "role": "user",
                             "content": (
-                                "Your last tool call was rejected by the API. "
-                                "Use exact parameter names from the tool schema: "
-                                "file_path (never path), new_content (never content), "
-                                "old_string/new_string for apply_patch. Retry the tool call."
+                                "Your last tool call failed JSON parsing or schema validation. "
+                                "Ensure all JSON quotes and braces are properly closed. "
+                                "Use exact schema parameter names: file_path (never path), "
+                                "new_content (never content), old_string/new_string for apply_patch. "
+                                "For long files or surgical updates, prefer 'apply_patch' instead of 'propose_edit'. "
+                                "Retry the tool call now."
                             ),
                         })
                         continue
@@ -711,6 +713,109 @@ class AgentPlanner:
             }
         return edit
 
+    @staticmethod
+    def _repair_truncated_json(raw: str) -> Optional[Dict[str, Any]]:
+        """Attempt to repair and parse truncated or slightly malformed JSON objects."""
+        if not raw or not isinstance(raw, str):
+            return None
+        text = raw.strip()
+        if not text.startswith("{"):
+            return None
+
+        # 1. Direct parse attempt
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        # 2. Progressively append closing quotes/braces
+        in_string = False
+        escape = False
+        brace_depth = 0
+        bracket_depth = 0
+
+        for ch in text:
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if not in_string:
+                if ch == '{':
+                    brace_depth += 1
+                elif ch == '}':
+                    brace_depth = max(0, brace_depth - 1)
+                elif ch == '[':
+                    bracket_depth += 1
+                elif ch == ']':
+                    bracket_depth = max(0, bracket_depth - 1)
+
+        repaired = text
+        if in_string:
+            repaired += '"'
+        if bracket_depth > 0:
+            repaired += ']' * bracket_depth
+        if brace_depth > 0:
+            repaired += '}' * brace_depth
+
+        try:
+            return json.loads(repaired)
+        except Exception:
+            pass
+
+        # 3. Regex fallback to extract tool name, file_path, and new_content/old_string/new_string
+        name_match = re.search(r'"name"\s*:\s*"(\\w+)"', text)
+        tool_name = name_match.group(1) if name_match else None
+        if not tool_name or tool_name not in AGENT_TOOL_NAMES:
+            for t_name in AGENT_TOOL_NAMES:
+                if f'"{t_name}"' in text:
+                    tool_name = t_name
+                    break
+
+        if tool_name:
+            fp_match = re.search(r'"file_path"\s*:\s*"([^"]+)"', text) or re.search(r'"path"\s*:\s*"([^"]+)"', text)
+            file_path = fp_match.group(1) if fp_match else None
+
+            if tool_name == "propose_edit" and file_path:
+                nc_match = re.search(r'"new_content"\s*:\s*"(.*)', text, re.DOTALL) or re.search(r'"content"\s*:\s*"(.*)', text, re.DOTALL)
+                if nc_match:
+                    raw_content = nc_match.group(1)
+                    try:
+                        content_fixed = json.loads('"' + raw_content.rstrip('\\') + '"')
+                    except Exception:
+                        content_fixed = raw_content.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\').rstrip('"}')
+                    return {
+                        "name": "propose_edit",
+                        "arguments": {
+                            "file_path": file_path,
+                            "new_content": content_fixed,
+                        },
+                    }
+
+            if tool_name == "apply_patch" and file_path:
+                old_match = re.search(r'"old_string"\s*:\s*"([^"]+)"', text)
+                new_match = re.search(r'"new_string"\s*:\s*"(.*)', text, re.DOTALL)
+                if old_match and new_match:
+                    raw_new = new_match.group(1)
+                    try:
+                        new_fixed = json.loads('"' + raw_new.rstrip('\\') + '"')
+                    except Exception:
+                        new_fixed = raw_new.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\').rstrip('"}')
+                    return {
+                        "name": "apply_patch",
+                        "arguments": {
+                            "file_path": file_path,
+                            "old_string": old_match.group(1),
+                            "new_string": new_fixed,
+                        },
+                    }
+
+        return None
+
     def _recover_failed_tool_generation(
         self,
         error_text: str,
@@ -746,7 +851,7 @@ class AgentPlanner:
                     pass
 
             # 2. Check for <function=name>{args}</function>
-            tool_match = re.search(r"<function=(\w+)\s*>?\s*", blob)
+            tool_match = re.search(r"<function=(\\w+)\s*>?\s*", blob)
             if tool_match:
                 tool_name = tool_match.group(1)
                 rest = blob[tool_match.end():].lstrip()
@@ -761,11 +866,8 @@ class AgentPlanner:
                             tool_name,
                         )
 
-            # 3. Direct JSON parsing
-            try:
-                parsed = json.loads(blob) if blob.strip().startswith("{") else None
-            except json.JSONDecodeError:
-                parsed = None
+            # 3. Direct or repaired JSON parsing
+            parsed = self._repair_truncated_json(blob)
             if isinstance(parsed, dict):
                 tool_name = parsed.get("name") or parsed.get("tool") or ""
                 raw_args = parsed.get("arguments") or parsed.get("parameters") or {}
@@ -774,28 +876,30 @@ class AgentPlanner:
                         try:
                             raw_args = json.loads(raw_args)
                         except json.JSONDecodeError:
-                            raw_args = {}
+                            repaired_args = self._repair_truncated_json(raw_args)
+                            raw_args = repaired_args if isinstance(repaired_args, dict) else {}
                     if isinstance(raw_args, dict):
                         return tool_name, normalize_tool_args(tool_name, raw_args)
 
             # 4. Search for any JSON object containing tool name in blob
-            for match_obj in re.finditer(r'\{\s*"name"\s*:\s*"(\w+)"', blob):
+            for match_obj in re.finditer(r'\{\s*"name"\s*:\s*"(\\w+)"', blob):
                 potential_name = match_obj.group(1)
                 if potential_name in AGENT_TOOL_NAMES:
                     start_pos = match_obj.start()
                     try:
                         obj, _ = json.JSONDecoder().raw_decode(blob[start_pos:])
-                        if isinstance(obj, dict):
-                            raw_args = obj.get("arguments") or obj.get("parameters") or {}
-                            if isinstance(raw_args, str):
-                                try:
-                                    raw_args = json.loads(raw_args)
-                                except json.JSONDecodeError:
-                                    raw_args = {}
-                            if isinstance(raw_args, dict):
-                                return potential_name, normalize_tool_args(potential_name, raw_args)
                     except Exception:
-                        pass
+                        obj = self._repair_truncated_json(blob[start_pos:])
+                    if isinstance(obj, dict):
+                        raw_args = obj.get("arguments") or obj.get("parameters") or {}
+                        if isinstance(raw_args, str):
+                            try:
+                                raw_args = json.loads(raw_args)
+                            except json.JSONDecodeError:
+                                repaired_args = self._repair_truncated_json(raw_args)
+                                raw_args = repaired_args if isinstance(repaired_args, dict) else {}
+                        if isinstance(raw_args, dict):
+                            return potential_name, normalize_tool_args(potential_name, raw_args)
 
             # 5. Bare function call: read_file(...)
             bare = re.search(
@@ -812,10 +916,10 @@ class AgentPlanner:
                 if rest.startswith("{"):
                     try:
                         args, _ = json.JSONDecoder().raw_decode(rest)
-                        if isinstance(args, dict):
-                            return tool_name, normalize_tool_args(tool_name, args)
                     except json.JSONDecodeError:
-                        pass
+                        args = self._repair_truncated_json(rest)
+                    if isinstance(args, dict):
+                        return tool_name, normalize_tool_args(tool_name, args)
 
         return None
 

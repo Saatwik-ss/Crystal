@@ -8,8 +8,9 @@ import type {
 } from '../types';
 import { llmPayload, type LlmSettings } from '../utils/llmSettings';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
-const WS_BASE_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || `${window.location.origin}/api`;
+const WS_BASE_URL = import.meta.env.VITE_WS_URL || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
+
 
 /** Session id used when no repository is uploaded */
 export const LOCAL_SESSION_ID = 'local';
@@ -42,7 +43,7 @@ class APIClient {
       formData.append('files', file, relativePath);
     });
 
-    const response = await this.client.post('/api/upload-repository', formData);
+    const response = await this.client.post('/upload-repository', formData);
 
     const responseData = response.data as any;
     const repository = responseData.repository ?? responseData;
@@ -55,14 +56,14 @@ class APIClient {
 
   async getRepositoryStatus(repoId: string): Promise<IndexingStatus> {
     const response = await this.client.get(
-      `/api/repositories/${repoId}/status`
+      `/repositories/${repoId}/status`
     );
     return response.data;
   }
 
   async listRepositoryFiles(repoId: string): Promise<RepositoryFile[]> {
     const response = await this.client.get(
-      `/api/repositories/${repoId}/files`
+      `/repositories/${repoId}/files`
     );
     return response.data.files;
   }
@@ -70,7 +71,7 @@ class APIClient {
   async readFile(repoId: string, filePath: string): Promise<string> {
     const normalizedPath = filePath.replace(/\\/g, '/');
     const response = await this.client.get(
-      `/api/repositories/${repoId}/file/${normalizedPath}`
+      `/repositories/${repoId}/file/${normalizedPath}`
     );
     return response.data.content;
   }
@@ -82,7 +83,7 @@ class APIClient {
   ): Promise<{ status: string }> {
     const normalizedPath = filePath.replace(/\\/g, '/');
     const response = await this.client.post(
-      `/api/repositories/${repoId}/file/${normalizedPath}`,
+      `/repositories/${repoId}/file/${normalizedPath}`,
       { content }
     );
     return response.data;
@@ -96,7 +97,7 @@ class APIClient {
     }
   ): Promise<{ applied: Array<{ file_path: string; status: string }>; request_id: string }> {
     const response = await this.client.post(
-      `/api/repositories/${repoId}/edits/apply`,
+      `/repositories/${repoId}/edits/apply`,
       payload
     );
     return response.data;
@@ -107,7 +108,7 @@ class APIClient {
     requestId: string
   ): Promise<{ undone: Array<{ file_path: string; status: string }>; request_id: string }> {
     const response = await this.client.post(
-      `/api/repositories/${repoId}/edits/undo`,
+      `/repositories/${repoId}/edits/undo`,
       { request_id: requestId }
     );
     return response.data;
@@ -313,7 +314,7 @@ class APIClient {
   // Search
 
   async fetchModels(apiKey: string): Promise<string[]> {
-    const response = await fetch(`${API_BASE_URL}/api/models`, {
+    const response = await fetch(`${API_BASE_URL}/models`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ api_key: apiKey }),
@@ -334,7 +335,7 @@ class APIClient {
     topK: number = 5
   ): Promise<SearchResult[]> {
     const response = await this.client.get(
-      `/api/search/${repoId}`,
+      `/search/${repoId}`,
       {
         params: {
           query,

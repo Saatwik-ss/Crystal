@@ -13,6 +13,9 @@ from starlette.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import asyncio
+import time
+import uuid
+from starlette.requests import Request
 import httpx
 from typing import Optional, List
 
@@ -105,6 +108,46 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Terminal Status & Health Logging Middleware
+@app.middleware("http")
+async def terminal_status_middleware(request: Request, call_next):
+    req_id = str(uuid.uuid4())[:8]
+    start_time = time.perf_counter()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    method = request.method
+    path = request.url.path
+
+    try:
+        response = await call_next(request)
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        status_code = response.status_code
+
+        # Health & Color formatting
+        if status_code < 400:
+            health_tag = "\033[92m[HEALTH: OK]\033[0m"
+            status_tag = f"\033[92m{status_code} OK\033[0m" if status_code == 200 else f"\033[92m{status_code}\033[0m"
+        elif status_code < 500:
+            health_tag = "\033[93m[HEALTH: WARN]\033[0m"
+            status_tag = f"\033[93m{status_code} CLIENT_ERROR\033[0m"
+        else:
+            health_tag = "\033[91m[HEALTH: ERROR]\033[0m"
+            status_tag = f"\033[91m{status_code} SERVER_ERROR\033[0m"
+
+        print(
+            f"[{timestamp}] [UUID: {req_id}] {health_tag} {method} {path} -> {status_tag} ({duration_ms}ms)",
+            flush=True,
+        )
+        return response
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        health_tag = "\033[91m[HEALTH: ERROR]\033[0m"
+        print(
+            f"[{timestamp}] [UUID: {req_id}] {health_tag} {method} {path} -> \033[91m500 EXCEPTION\033[0m ({duration_ms}ms) | Error: {exc}",
+            flush=True,
+        )
+        raise exc
+
 
 # Include routers
 app.include_router(repository_routes.router)
@@ -271,10 +314,16 @@ async def undo_edits(repo_id: str, body: UndoEditsBody):
 @app.websocket("/ws/chat/{repo_id}")
 async def websocket_chat(websocket: WebSocket, repo_id: str):
     """WebSocket endpoint for real-time chat with streaming responses"""
+    ws_id = str(uuid.uuid4())[:8]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [UUID: {ws_id}] \033[92m[HEALTH: OK]\033[0m WS /ws/chat/{repo_id} -> \033[92mCONNECTED\033[0m", flush=True)
     await websocket.accept()
     try:
         while True:
             data = await websocket.receive_json()
+            msg_snippet = str(data.get("message") or "")[:40].replace("\n", " ")
+            msg_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{msg_ts}] [UUID: {ws_id}] \033[92m[HEALTH: OK]\033[0m WS /ws/chat/{repo_id} -> RECEIVED_MSG: \"{msg_snippet}\"", flush=True)
             
             # Local session (no uploaded repo) gets empty context
             if repo_id in ("local", "none", "__none__"):
@@ -300,9 +349,11 @@ async def websocket_chat(websocket: WebSocket, repo_id: str):
                 await websocket.send_json(chunk)
                 
     except WebSocketDisconnect:
-        logger.debug("Chat client disconnected: %s", repo_id)
+        disc_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{disc_ts}] [UUID: {ws_id}] \033[92m[HEALTH: OK]\033[0m WS /ws/chat/{repo_id} -> \033[93mDISCONNECTED\033[0m", flush=True)
     except Exception as e:
-        logger.exception("Chat WebSocket error")
+        err_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{err_ts}] [UUID: {ws_id}] \033[91m[HEALTH: ERROR]\033[0m WS /ws/chat/{repo_id} -> \033[91mERROR\033[0m: {e}", flush=True)
         if websocket.client_state == WebSocketState.CONNECTED:
             try:
                 await websocket.send_json({"error": str(e), "type": "error"})
@@ -318,6 +369,9 @@ async def websocket_chat(websocket: WebSocket, repo_id: str):
 @app.websocket("/ws/completion/{repo_id}")
 async def websocket_completion(websocket: WebSocket, repo_id: str):
     """WebSocket endpoint for code completion with streaming"""
+    ws_id = str(uuid.uuid4())[:8]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [UUID: {ws_id}] \033[92m[HEALTH: OK]\033[0m WS /ws/completion/{repo_id} -> \033[92mCONNECTED\033[0m", flush=True)
     await websocket.accept()
     try:
         while True:
@@ -348,9 +402,11 @@ async def websocket_completion(websocket: WebSocket, repo_id: str):
                     await websocket.send_json(chunk)
                 
     except WebSocketDisconnect:
-        logger.debug("Completion client disconnected: %s", repo_id)
+        disc_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{disc_ts}] [UUID: {ws_id}] \033[92m[HEALTH: OK]\033[0m WS /ws/completion/{repo_id} -> \033[93mDISCONNECTED\033[0m", flush=True)
     except Exception as e:
-        logger.exception("Completion WebSocket error")
+        err_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{err_ts}] [UUID: {ws_id}] \033[91m[HEALTH: ERROR]\033[0m WS /ws/completion/{repo_id} -> \033[91mERROR\033[0m: {e}", flush=True)
         if websocket.client_state == WebSocketState.CONNECTED:
             try:
                 await websocket.send_json({"error": str(e), "type": "error"})

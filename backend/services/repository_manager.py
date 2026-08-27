@@ -103,16 +103,29 @@ class RepositoryManager():
                 try:
                     relative_path = file_path.relative_to(repo_path).as_posix()
                     content = file_path.read_text(encoding='utf-8', errors='ignore')
-                    ext = file_path.suffix
+                    ext = file_path.suffix.lower()
                     language = self._get_language(ext)
                     ast_data = None
-                    if (language in ['python', 'javascript', 'typescript']):
-                        ast_data = ast_service.parse_file(content, language)
-                    repo_file = RepositoryFile(repository_id=repo_id, path=str(relative_path), language=language, content_hash=self._hash_content(content), ast_data=(json.dumps(ast_data) if ast_data else None), size=len(content))
+                    if language in ['python', 'javascript', 'typescript']:
+                        try:
+                            ast_data = ast_service.parse_file(content, language)
+                        except Exception as ast_err:
+                            logger.warning(f"AST parsing failed for {relative_path}: {ast_err}")
+                    repo_file = RepositoryFile(
+                        repository_id=repo_id,
+                        path=str(relative_path),
+                        language=language,
+                        content_hash=self._hash_content(content),
+                        ast_data=(json.dumps(ast_data) if ast_data else None),
+                        size=len(content)
+                    )
                     db.add(repo_file)
-                    chunks = chunking_service.chunk_file(content, str(relative_path), language, ast_data)
-                    if chunks:
-                        (await embedding_service.store_symbol_embeddings(repo_id, chunks))
+                    try:
+                        chunks = chunking_service.chunk_file(content, str(relative_path), language, ast_data)
+                        if chunks:
+                            (await embedding_service.store_symbol_embeddings(repo_id, chunks))
+                    except Exception as emb_err:
+                        logger.warning(f"Embedding failed for {relative_path}: {emb_err}")
                     self.indexing_status[repo_id]['files_processed'] = (idx + 1)
                 except Exception as e:
                     logger.error(f'Error processing file {file_path}: {e}')
@@ -130,26 +143,61 @@ class RepositoryManager():
             if db:
                 await db.close()
 
+    BINARY_EXTENSIONS = {
+        '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp', '.bmp', '.tiff',
+        '.exe', '.dll', '.so', '.dylib', '.bin', '.obj', '.o', '.a', '.lib',
+        '.zip', '.tar', '.gz', '.tgz', '.bz2', '.7z', '.rar', '.iso',
+        '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx',
+        '.mp3', '.mp4', '.wav', '.avi', '.mov', '.mkv', '.webm',
+        '.woff', '.woff2', '.ttf', '.eot', '.otf',
+        '.pyc', '.pyo', '.pyd', '.class', '.jar', '.war',
+        '.db', '.sqlite', '.sqlite3',
+    }
+
     async def _traverse_repository(self, repo_path: Path) -> List[Path]:
-        'Recursively traverse repository and collect code files'
+        """Recursively traverse repository and collect code and text files."""
         files = []
-        code_extensions = {'.py', '.js', '.ts', '.tsx', '.jsx', '.java', '.cpp', '.c', '.h', '.go', '.rs', '.rb', '.php', '.swift', '.kt', '.scala'}
 
         def should_ignore(path: Path) -> bool:
+            for part in path.parts:
+                if part in IGNORE_DIRS:
+                    return True
+                if part.startswith('.') and part != '.' and not part.startswith('.env') and not part.startswith('.git'):
+                    return True
             if path.is_dir():
-                return ((path.name in IGNORE_DIRS) or path.name.startswith('.'))
-            return (path.suffix not in code_extensions)
+                return False
+            if path.suffix.lower() in self.BINARY_EXTENSIONS:
+                return True
+            if path.name in IGNORE_FILES:
+                return True
+            try:
+                if path.stat().st_size > 5 * 1024 * 1024:
+                    return True
+            except Exception:
+                return True
+            return False
+
         for item in repo_path.rglob('*'):
-            if should_ignore(item):
-                continue
-            if item.is_file():
+            if item.is_file() and not should_ignore(item):
                 files.append(item)
         return sorted(files)
 
     def _get_language(self, extension: str) -> str:
-        'Map file extension to language'
-        ext_map = {'.py': 'python', '.js': 'javascript', '.ts': 'typescript', '.tsx': 'typescript', '.jsx': 'javascript', '.java': 'java', '.cpp': 'cpp', '.c': 'c', '.h': 'c', '.go': 'go', '.rs': 'rust', '.rb': 'ruby', '.php': 'php', '.swift': 'swift', '.kt': 'kotlin'}
-        return ext_map.get(extension, 'unknown')
+        """Map file extension to language"""
+        ext = (extension or "").lower()
+        ext_map = {
+            '.py': 'python', '.js': 'javascript', '.ts': 'typescript', '.tsx': 'typescript',
+            '.jsx': 'javascript', '.java': 'java', '.cpp': 'cpp', '.c': 'c', '.h': 'c',
+            '.hpp': 'cpp', '.go': 'go', '.rs': 'rust', '.rb': 'ruby', '.php': 'php',
+            '.swift': 'swift', '.kt': 'kotlin', '.scala': 'scala', '.cs': 'csharp',
+            '.dart': 'dart', '.html': 'html', '.htm': 'html', '.css': 'css',
+            '.scss': 'scss', '.less': 'less', '.json': 'json', '.md': 'markdown',
+            '.markdown': 'markdown', '.txt': 'plaintext', '.yaml': 'yaml', '.yml': 'yaml',
+            '.xml': 'xml', '.sql': 'sql', '.sh': 'bash', '.bash': 'bash', '.zsh': 'bash',
+            '.ps1': 'powershell', '.bat': 'batch', '.vue': 'vue', '.svelte': 'svelte',
+            '.toml': 'toml', '.ini': 'ini', '.lua': 'lua', '.r': 'r',
+        }
+        return ext_map.get(ext, 'plaintext')
 
     def _chunk_file(self, content: str, file_path: Path, chunk_size: int=1000) -> List[str]:
         'Split file content into chunks for embedding'
@@ -249,12 +297,26 @@ class RepositoryManager():
         full_path.write_text(content, encoding='utf-8')
         db = (await get_db())
         try:
-            repo_file = (await db.scalars(select(RepositoryFile).where((RepositoryFile.repository_id == repo_id), (RepositoryFile.path == file_path)))).first()
+            file_path_clean = file_path.replace('\\', '/')
+            repo_file = (await db.scalars(select(RepositoryFile).where((RepositoryFile.repository_id == repo_id), (RepositoryFile.path == file_path_clean)))).first()
+            ext = Path(file_path_clean).suffix.lower()
+            language = self._get_language(ext)
             if repo_file:
                 repo_file.content_hash = self._hash_content(content)
                 repo_file.size = len(content)
+                repo_file.language = language
+            else:
+                repo_file = RepositoryFile(
+                    repository_id=repo_id,
+                    path=file_path_clean,
+                    language=language,
+                    content_hash=self._hash_content(content),
+                    ast_data=None,
+                    size=len(content)
+                )
+                db.add(repo_file)
             (await db.commit())
-            return {'path': file_path, 'status': 'saved', 'size': len(content)}
+            return {'path': file_path_clean, 'status': 'saved', 'size': len(content)}
         finally:
             (await db.close())
 

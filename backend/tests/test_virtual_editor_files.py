@@ -109,4 +109,11 @@ class VirtualEditorFilesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clean[1]["role"], "assistant")
         self.assertEqual(clean[1]["content"], "[Called tool read_file]")
         self.assertEqual(clean[2]["role"], "user")
-
+    def test_truncated_failed_generation_recovery(self):
+        planner = AgentPlanner.__new__(AgentPlanner)
+        truncated_payload = '{"name": "propose_edit", "arguments": {"file_path":"generate_interview.js","new_content":"// generate_interview.js\nconst fs = require(\'fs\');\nPacker.toBuffer(doc).'
+        recovered = planner._recover_failed_tool_generation(truncated_payload)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered[0], "propose_edit")
+        self.assertEqual(recovered[1]["file_path"], "generate_interview.js")
+        self.assertIn("Packer.toBuffer", recovered[1]["new_content"])
