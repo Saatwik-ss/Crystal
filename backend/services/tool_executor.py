@@ -221,9 +221,10 @@ class ToolExecutor:
         # Read file
         self.register_tool(
             "read_file",
-            "Read file content from repository",
+            "Read file content from repository. Use parameter file_path (or path).",
             {
-                "file_path": {"type": "string", "description": "Path to file"},
+                "file_path": {"type": "string", "description": "Path to file", "default": ""},
+                "path": {"type": "string", "description": "Alias for file_path", "default": ""},
                 "line_start": {"type": "integer", "description": "Optional start line", "default": 1},
                 "line_end": {"type": "integer", "description": "Optional end line", "default": -1}
             },
@@ -235,8 +236,9 @@ class ToolExecutor:
             "write_file",
             "Write content to file",
             {
-                "file_path": {"type": "string", "description": "Path to file"},
-                "content": {"type": "string", "description": "File content"}
+                "file_path": {"type": "string", "description": "Path to file", "default": ""},
+                "path": {"type": "string", "description": "Alias for file_path", "default": ""},
+                "content": {"type": "string", "description": "File content", "default": ""}
             },
             self._write_file
         )
@@ -246,8 +248,10 @@ class ToolExecutor:
             "propose_edit",
             "Propose a complete file replacement for NEW or tiny files. Prefer apply_patch for existing files. Pass FULL new file content.",
             {
-                "file_path": {"type": "string", "description": "Path to file to edit"},
-                "new_content": {"type": "string", "description": "Complete new file content"},
+                "file_path": {"type": "string", "description": "Path to file to edit", "default": ""},
+                "path": {"type": "string", "description": "Alias for file_path", "default": ""},
+                "new_content": {"type": "string", "description": "Complete new file content", "default": ""},
+                "content": {"type": "string", "description": "Alias for new_content", "default": ""},
                 "rationale": {
                     "type": "string",
                     "description": "Brief reason for the change",
@@ -259,11 +263,17 @@ class ToolExecutor:
 
         self.register_tool(
             "apply_patch",
-            "Apply an exact search/replace patch to an existing file. REQUIRED param name is file_path (not path). old_string must uniquely match once.",
+            "Apply an exact search/replace patch to an existing file. Use file_path (or path). old_string must uniquely match once.",
             {
                 "file_path": {
                     "type": "string",
-                    "description": "Path to existing file (use key file_path, never path)",
+                    "description": "Path to existing file",
+                    "default": "",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Alias for file_path",
+                    "default": "",
                 },
                 "old_string": {"type": "string", "description": "Exact text to find (must be unique)"},
                 "new_string": {"type": "string", "description": "Replacement text"},
@@ -319,7 +329,8 @@ class ToolExecutor:
             "run_terminal",
             "Run an allowlisted verify command (pytest, npm test, tsc, eslint, ruff, mypy, cargo test, go test, etc.) in the repo root.",
             {
-                "command": {"type": "string", "description": "Full command to run"},
+                "command": {"type": "string", "description": "Full command to run", "default": ""},
+                "cmd": {"type": "string", "description": "Alias for command", "default": ""},
             },
             self._run_terminal,
         )
@@ -491,9 +502,12 @@ class ToolExecutor:
         """Semantic search"""
         return await self.search_service._semantic_search(repo_id, query, top_k)
     
-    async def _read_file(self, repo_id: str, file_path: str, **kwargs) -> str:
+    async def _read_file(self, repo_id: str, file_path: str = "", **kwargs) -> str:
         """Read file"""
-        content = await self._resolve_file_content(repo_id, file_path)
+        target_path = (file_path or kwargs.get("path") or "").strip()
+        if not target_path:
+            return "Error: file_path is required"
+        content = await self._resolve_file_content(repo_id, target_path)
         
         # Optionally handle line_start and line_end
         line_start = kwargs.get('line_start')
@@ -925,17 +939,19 @@ class ToolExecutor:
                 if "default" not in spec:
                     required.append(key)
 
+            param_schema: Dict[str, Any] = {
+                "type": "object",
+                "properties": properties,
+            }
+            if required:
+                param_schema["required"] = required
+
             schemas.append({
                 "type": "function",
                 "function": {
                     "name": tool_name,
                     "description": tool.description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                        "additionalProperties": False,
-                    }
+                    "parameters": param_schema,
                 }
             })
         return schemas

@@ -1145,6 +1145,7 @@ Workflow (follow this for non-trivial work):
 6. Call finish with a short summary when done. Do NOT dump large code samples in chat.
 
 CRITICAL RULES:
+- In tool calls (read_file, propose_edit, apply_patch), use the parameter name `file_path`.
 - Never invent illustrative toy files.
 - Never skip reading a file before patching it.
 - Keep patches minimal and correct.
