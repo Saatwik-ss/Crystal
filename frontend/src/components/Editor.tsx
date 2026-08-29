@@ -202,6 +202,15 @@ export default function Editor({ onRequestNewFile }: EditorProps) {
     COMPLETION_LANGUAGES.forEach((lang) => {
       monaco.languages.register({ id: lang });
     });
+    monaco.editor.defineTheme('vs-dark-black', {
+      base: 'vs-dark',
+      inherit: true,
+      rules: [],
+      colors: {
+        'editor.background': '#141414',
+        'editorGutter.background': '#141414',
+      },
+    });
   };
 
   const language = currentFile
@@ -221,7 +230,7 @@ export default function Editor({ onRequestNewFile }: EditorProps) {
             language={language}
             value={currentFile.content}
             onChange={handleEditorChange}
-            theme="vs-dark"
+            theme="vs-dark-black"
             beforeMount={handleBeforeMount}
             onMount={(editor, monaco) => {
               handleEditorMount(editor, monaco);

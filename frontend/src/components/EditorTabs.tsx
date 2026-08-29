@@ -23,8 +23,8 @@ export default function EditorTabs() {
           className={clsx(
             'flex items-center gap-2 px-4 py-3 border-r border-gray-700 cursor-pointer transition-colors',
             activeFile === file.path
-              ? 'bg-gray-700 text-white border-b-2 border-blue-500'
-              : 'bg-gray-800 text-gray-300 hover:bg-gray-750'
+              ? 'bg-gray-900 text-white border-b-2 border-blue-500'
+              : 'bg-gray-800 text-gray-400 hover:bg-gray-750'
           )}
           onClick={() => setActiveFile(file.path)}
         >
