@@ -18,19 +18,21 @@ from services.llm_config import get_groq_client, supports_tools
 
 def test_is_gemini_key():
     assert is_gemini_key("AIzaSyB1234567890abcdef") is True
-    assert is_gemini_key("  AIzaSyTest  ") is True
+    assert is_gemini_key("AQ.1234567890abcdef") is True
+    assert is_gemini_key("  AQ.TestKey  ") is True
     assert is_gemini_key("gsk_1234567890abcdef") is False
-    assert is_gemini_key("sk-1234567890abcdef") is False
     assert is_gemini_key("") is False
     assert is_gemini_key(None) is False
 
 
 def test_detect_provider():
     assert detect_provider(api_key="AIzaSy123") == "gemini"
+    assert detect_provider(api_key="AQ.123") == "gemini"
     assert detect_provider(api_key="gsk_123") == "groq"
     assert detect_provider(api_key="random", model="gemini-2.5-flash") == "gemini"
     assert detect_provider(api_key="random", model="llama-3.3-70b-versatile") == "groq"
-    assert detect_provider() == "groq"
+    with patch.dict("os.environ", {}, clear=True):
+        assert detect_provider() == "groq"
 
 
 def test_resolve_provider_model():

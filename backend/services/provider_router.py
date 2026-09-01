@@ -2,6 +2,7 @@
 Provider router for dynamically dispatching LLM calls between Groq and Gemini
 based on the provided API key or model.
 """
+import os
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -43,17 +44,39 @@ def _sanitize_key(key: Optional[str]) -> str:
 
 
 def is_gemini_key(key: Optional[str]) -> bool:
-    """Check if the provided key matches the Google/Gemini key format (starts with AIza)."""
+    """
+    Check if the provided key matches Google/Gemini key format.
+    Supports traditional AIza keys, new 2026 AQ. keys, and any non-Groq keys.
+    """
     clean_key = _sanitize_key(key)
-    return clean_key.startswith("AIza")
+    if not clean_key:
+        return False
+    if clean_key.startswith("gsk_"):
+        return False
+    return True
 
 
 def detect_provider(api_key: Optional[str] = None, model: Optional[str] = None) -> str:
     """Detect whether this request is for Gemini or Groq."""
     clean_key = _sanitize_key(api_key)
-    if is_gemini_key(clean_key):
-        return "gemini"
+    # Check explicit key prefixes first
+    if clean_key:
+        if clean_key.startswith("gsk_"):
+            return "groq"
+        if clean_key.startswith("AIza") or clean_key.startswith("AQ"):
+            return "gemini"
+
+    # Check model name hints
     if model and "gemini" in model.lower():
+        return "gemini"
+    if model and any(x in model.lower() for x in ["llama", "mixtral", "qwen", "gemma"]):
+        return "groq"
+
+    # If an unrecognized custom key is provided, route to Gemini (since Groq only accepts gsk_)
+    if clean_key:
+        return "gemini"
+
+    if os.getenv("GEMINI_API_KEY") and not os.getenv("GROQ_API_KEY"):
         return "gemini"
     return "groq"
 

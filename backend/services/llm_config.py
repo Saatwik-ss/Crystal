@@ -482,13 +482,15 @@ def get_groq_client(
         is_gemini_key,
     )
 
-    key = resolve_api_key(user_key)
-    if not key and os.getenv("GEMINI_API_KEY"):
-        key = os.getenv("GEMINI_API_KEY")
-
-    provider = detect_provider(key, user_model)
+    provider = detect_provider(user_key, user_model)
     if provider == "gemini":
+        key = (user_key or "").strip() or os.getenv("GEMINI_API_KEY") or os.getenv("GROQ_API_KEY") or ""
         model_name = resolve_provider_model("gemini", user_model)
+        logger.info(
+            "get_groq_client: routing to Gemini with model=%s, key_prefix=%s",
+            model_name,
+            (key[:6] + "...") if key else "EMPTY",
+        )
         if not key:
             return None, model_name, False
         if (
@@ -499,7 +501,13 @@ def get_groq_client(
             return fallback_client, model_name, True
         return create_provider_client("gemini", key, model_name)
 
+    key = resolve_api_key(user_key)
     model_name = resolve_model(user_model)
+    logger.info(
+        "get_groq_client: routing to Groq with model=%s, key_prefix=%s",
+        model_name,
+        (key[:6] + "...") if key else "EMPTY",
+    )
     if not key:
         return None, model_name, False
 

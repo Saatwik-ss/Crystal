@@ -348,7 +348,9 @@ async def websocket_chat(websocket: WebSocket, repo_id: str):
             data = await websocket.receive_json()
             msg_snippet = str(data.get("message") or "")[:40].replace("\n", " ")
             msg_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{msg_ts}] [UUID: {ws_id}] \033[92m[HEALTH: OK]\033[0m WS /ws/chat/{repo_id} -> RECEIVED_MSG: \"{msg_snippet}\"", flush=True)
+            api_key_val = data.get("api_key")
+            key_preview = f"{api_key_val[:6]}... (len {len(api_key_val)})" if api_key_val else "None (using server env)"
+            print(f"[{msg_ts}] [UUID: {ws_id}] \033[92m[HEALTH: OK]\033[0m WS /ws/chat/{repo_id} -> RECEIVED_MSG: \"{msg_snippet}\" | key: {key_preview} | model: {data.get('model') or 'default'}", flush=True)
             
             # Local session (no uploaded repo) gets empty context
             if repo_id in ("local", "none", "__none__"):
