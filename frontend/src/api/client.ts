@@ -29,6 +29,7 @@ class APIClient {
   } | null = null;
   private closingKeys = new Set<string>();
   private chatFirstChunkWatchdog: number | null = null;
+  private chatOnMessage: ((message: any) => void) | null = null;
 
   constructor() {
     this.client = axios.create({
@@ -130,6 +131,7 @@ class APIClient {
 
     const wsUrl = `${WS_BASE_URL}/ws/chat/${id}`;
     const ws = new WebSocket(wsUrl);
+    this.chatOnMessage = onMessage;
 
     ws.onmessage = (event) => {
       try {
@@ -213,15 +215,10 @@ class APIClient {
       this.chatFirstChunkWatchdog = null;
       const live = this.wsConnections.get(`chat_${id}`);
       if (live === ws) {
-        const handler = live.onmessage;
-        if (handler) {
-          handler({
-            data: JSON.stringify({
-              type: 'error',
-              error: 'Chat timed out waiting for a response',
-            }),
-          } as MessageEvent);
-        }
+        this.chatOnMessage?.({
+          type: 'error',
+          error: 'Chat timed out waiting for a response',
+        });
       }
     }, 45000);
   }
