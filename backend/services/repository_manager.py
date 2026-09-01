@@ -62,79 +62,139 @@ class RepositoryManager():
         self.indexing_status: Dict[(str, Dict[(str, Any)])] = {}
 
     async def process_upload(self, files: List[UploadFile]) -> str:
-        'Process uploaded files and create repository'
+        """Process uploaded files and create repository with immediate file records"""
         repo_id = str(uuid.uuid4())
         repo_path = (self.upload_dir / repo_id)
         repo_path.mkdir(parents=True, exist_ok=True)
+        file_records = []
         for file in files:
             relative_name = file.filename.replace('\\', '/')
             file_path = (repo_path / relative_name)
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            contents = (await file.read())
+            contents = await file.read()
             with open(file_path, 'wb') as f:
                 f.write(contents)
-        db = (await get_db())
+            ext = Path(relative_name).suffix.lower()
+            file_records.append(
+                RepositoryFile(
+                    repository_id=repo_id,
+                    path=str(relative_name),
+                    language=self._get_language(ext),
+                    content_hash=self._hash_content(contents.decode('utf-8', errors='ignore')),
+                    size=len(contents),
+                )
+            )
+        db = await get_db()
         try:
             repository = Repository(id=repo_id, name=repo_id, path=str(repo_path), created_at=datetime.utcnow())
             db.add(repository)
-            (await db.commit())
-            self.indexing_status[repo_id] = {'status': 'initializing', 'files_processed': 0, 'total_files': 0, 'errors': []}
-            logger.info(f'Repository {repo_id} uploaded to {repo_path}')
+            for rf in file_records:
+                db.add(rf)
+            await db.commit()
+            self.indexing_status[repo_id] = {
+                'status': 'initializing',
+                'files_processed': 0,
+                'total_files': len(file_records),
+                'errors': []
+            }
+            logger.info(f'Repository {repo_id} uploaded with {len(file_records)} files to {repo_path}')
             return repo_id
         finally:
-            (await db.close())
+            await db.close()
 
     async def index_repository(self, repo_id: str) -> None:
         """
-        Index repository: traverse files, generate AST, embeddings, and dependency graph
+        Index repository: generate AST, embeddings, and dependency graph.
+        Files are already populated in DB during process_upload.
         """
         db = None
         try:
             repo_path = (self.upload_dir / repo_id)
             self.indexing_status[repo_id]['status'] = 'indexing'
-            files = (await self._traverse_repository(repo_path))
+            files = await self._traverse_repository(repo_path)
             self.indexing_status[repo_id]['total_files'] = len(files)
-            db = (await get_db())
+            db = await get_db()
             ast_service = ASTService()
             embedding_service = EmbeddingService()
             chunking_service = ChunkingService(ast_service)
-            embedding_service.reset_collection(repo_id)
+            try:
+                embedding_service.reset_collection(repo_id)
+            except Exception as reset_err:
+                logger.warning(f"Could not reset Chroma collection for {repo_id}: {reset_err}")
+
+            SKIP_EMBED_FILENAMES = {
+                'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'cargo.lock',
+                'poetry.lock', 'pipfile.lock', 'composer.lock', 'gemfile.lock'
+            }
+            SKIP_EMBED_SUFFIXES = {
+                '.min.js', '.min.css', '.map', '.bundle.js', '.chunk.js',
+                '.lock', '.csv', '.tsv', '.jsonl'
+            }
+
             for (idx, file_path) in enumerate(files):
                 try:
                     relative_path = file_path.relative_to(repo_path).as_posix()
+                    file_size = file_path.stat().st_size
                     content = file_path.read_text(encoding='utf-8', errors='ignore')
                     ext = file_path.suffix.lower()
                     language = self._get_language(ext)
                     ast_data = None
-                    if language in ['python', 'javascript', 'typescript']:
+                    if language in ['python', 'javascript', 'typescript'] and file_size < 300 * 1024:
                         try:
                             ast_data = ast_service.parse_file(content, language)
                         except Exception as ast_err:
                             logger.warning(f"AST parsing failed for {relative_path}: {ast_err}")
-                    repo_file = RepositoryFile(
-                        repository_id=repo_id,
-                        path=str(relative_path),
-                        language=language,
-                        content_hash=self._hash_content(content),
-                        ast_data=(json.dumps(ast_data) if ast_data else None),
-                        size=len(content)
+
+                    existing = (await db.scalars(
+                        select(RepositoryFile).where(
+                            RepositoryFile.repository_id == repo_id,
+                            RepositoryFile.path == str(relative_path)
+                        )
+                    )).first()
+
+                    if existing:
+                        existing.language = language
+                        existing.content_hash = self._hash_content(content)
+                        existing.ast_data = (json.dumps(ast_data) if ast_data else None)
+                        existing.size = len(content)
+                    else:
+                        repo_file = RepositoryFile(
+                            repository_id=repo_id,
+                            path=str(relative_path),
+                            language=language,
+                            content_hash=self._hash_content(content),
+                            ast_data=(json.dumps(ast_data) if ast_data else None),
+                            size=len(content)
+                        )
+                        db.add(repo_file)
+
+                    should_skip_embed = (
+                        file_path.name.lower() in SKIP_EMBED_FILENAMES
+                        or any(file_path.name.lower().endswith(s) for s in SKIP_EMBED_SUFFIXES)
+                        or file_size > 300 * 1024
                     )
-                    db.add(repo_file)
-                    try:
-                        chunks = chunking_service.chunk_file(content, str(relative_path), language, ast_data)
-                        if chunks:
-                            (await embedding_service.store_symbol_embeddings(repo_id, chunks))
-                    except Exception as emb_err:
-                        logger.warning(f"Embedding failed for {relative_path}: {emb_err}")
+
+                    if not should_skip_embed:
+                        try:
+                            chunks = chunking_service.chunk_file(content, str(relative_path), language, ast_data)
+                            if chunks:
+                                await embedding_service.store_symbol_embeddings(repo_id, chunks[:20])
+                        except Exception as emb_err:
+                            logger.warning(f"Embedding failed for {relative_path}: {emb_err}")
+
                     self.indexing_status[repo_id]['files_processed'] = (idx + 1)
                 except Exception as e:
                     logger.error(f'Error processing file {file_path}: {e}')
                     self.indexing_status[repo_id]['errors'].append(str(e))
-            (await db.commit())
-            (await self._build_dependency_graph(repo_id))
+
+            await db.commit()
+            try:
+                await self._build_dependency_graph(repo_id)
+            except Exception as dg_err:
+                logger.warning(f"Dependency graph building failed: {dg_err}")
+
             self.indexing_status[repo_id]['status'] = 'completed'
-            logger.info(f'Repository {repo_id} indexing completed')
-            self._start_file_watcher(repo_id, repo_path)
+            logger.info(f'Repository {repo_id} indexing completed successfully')
         except Exception as e:
             logger.error(f'Repository indexing failed for {repo_id}: {e}')
             self.indexing_status[repo_id]['status'] = 'failed'

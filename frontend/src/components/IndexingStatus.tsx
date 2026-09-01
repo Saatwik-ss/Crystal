@@ -10,9 +10,13 @@ export default function IndexingStatus() {
   const percentage =
     total_files > 0 ? Math.round((files_processed / total_files) * 100) : 0;
 
+  const isDone =
+    status === 'completed' ||
+    (total_files > 0 && files_processed >= total_files && status !== 'failed');
+
   return (
     <div className="flex items-center gap-2">
-      {(status === 'initializing' || status === 'indexing') && (
+      {!isDone && (status === 'initializing' || status === 'indexing') && (
         <>
           <Loader size={14} className="animate-spin text-blue-400" />
           <span className="text-xs text-gray-400">
@@ -27,7 +31,7 @@ export default function IndexingStatus() {
         </>
       )}
 
-      {status === 'completed' && (
+      {isDone && status !== 'failed' && (
         <>
           <CheckCircle size={14} className="text-green-400" />
           <span className="text-xs text-green-400">Indexed</span>
