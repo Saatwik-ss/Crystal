@@ -153,12 +153,32 @@ export default function Upload({ onUploadComplete, compact = false }: UploadProp
       setIsUploading(true);
       setError(null);
 
-      const repository = await apiClient.uploadRepository(files);
+      const previousId = useAppStore.getState().currentRepository?.id;
+      if (previousId) {
+        try {
+          await apiClient.deleteRepository(previousId);
+        } catch (cleanupErr) {
+          console.warn('Could not clean previous repository from SQL:', cleanupErr);
+        }
+      }
+
+      const CHUNK = 30;
+      let repository: Awaited<ReturnType<typeof apiClient.uploadRepository>> | null = null;
+      for (let i = 0; i < files.length; i += CHUNK) {
+        const chunk = files.slice(i, i + CHUNK);
+        const isLast = i + CHUNK >= files.length;
+        repository = await apiClient.uploadRepository(chunk, {
+          repoId: repository?.id,
+          finalize: isLast,
+        });
+        if (i === 0 && repository?.id) {
+          setCurrentRepository(repository);
+        }
+      }
       if (!repository?.id) {
         throw new Error('Upload response missing repository id');
       }
 
-      setCurrentRepository(repository);
       onUploadComplete();
     } catch (err) {
       const message =

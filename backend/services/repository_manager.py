@@ -9,13 +9,13 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 import logging
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from fastapi import UploadFile
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import uuid
 from database.db import get_db
-from database.models import Repository, RepositoryFile, IndexingStatus
+from database.models import Repository, RepositoryFile, IndexingStatus, CodeSnapshot
 from .ast_service import ASTService
 from .embedding_service import EmbeddingService
 from .chunking_service import ChunkingService
@@ -53,7 +53,7 @@ class RepositoryFileWatcher(FileSystemEventHandler):
         except Exception as e:
             logger.error(f"Error triggering re-index for {self.repo_id}: {e}")
 
-INDEX_COMMIT_BATCH = 50
+INDEX_COMMIT_BATCH = 30
 MAX_INDEX_ERRORS = 50
 # Dedicated pool so indexing I/O never starves aiosqlite (default executor).
 _INDEX_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="crystal-index")
@@ -67,45 +67,66 @@ class RepositoryManager():
         self.indexing_status: Dict[(str, Dict[(str, Any)])] = {}
         self.embedding_service = embedding_service
 
-    async def process_upload(self, files: List[UploadFile]) -> str:
-        """Process uploaded files and create repository with immediate file records"""
-        repo_id = str(uuid.uuid4())
+    async def process_upload(self, files: List[UploadFile], repo_id: Optional[str] = None) -> str:
+        """Process uploaded files in batches of 30 and create or append repository records."""
+        is_new = not repo_id
+        if is_new:
+            repo_id = str(uuid.uuid4())
         repo_path = (self.upload_dir / repo_id)
         repo_path.mkdir(parents=True, exist_ok=True)
-        file_records = []
-        for idx, file in enumerate(files):
-            relative_name = file.filename.replace('\\', '/')
-            file_path = (repo_path / relative_name)
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            contents = await file.read()
-            with open(file_path, 'wb') as f:
-                f.write(contents)
-            ext = Path(relative_name).suffix.lower()
-            file_records.append(
-                RepositoryFile(
+
+        db = await get_db()
+        try:
+            if is_new:
+                db.add(Repository(
+                    id=repo_id,
+                    name=repo_id,
+                    path=str(repo_path),
+                    created_at=datetime.utcnow(),
+                ))
+                await db.commit()
+                self.indexing_status[repo_id] = {
+                    'status': 'initializing',
+                    'files_processed': 0,
+                    'total_files': 0,
+                    'errors': [],
+                }
+
+            pending = 0
+            added = 0
+            for idx, file in enumerate(files):
+                relative_name = (file.filename or f'file_{idx}').replace('\\', '/')
+                file_path = (repo_path / relative_name)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                contents = await file.read()
+                with open(file_path, 'wb') as f:
+                    f.write(contents)
+                ext = Path(relative_name).suffix.lower()
+                db.add(RepositoryFile(
                     repository_id=repo_id,
                     path=str(relative_name),
                     language=self._get_language(ext),
                     content_hash=self._hash_content(contents.decode('utf-8', errors='ignore')),
                     size=len(contents),
-                )
-            )
-            if idx % 25 == 24:
-                await asyncio.sleep(0)
-        db = await get_db()
-        try:
-            repository = Repository(id=repo_id, name=repo_id, path=str(repo_path), created_at=datetime.utcnow())
-            db.add(repository)
-            for rf in file_records:
-                db.add(rf)
-            await db.commit()
-            self.indexing_status[repo_id] = {
+                ))
+                pending += 1
+                added += 1
+                if pending >= INDEX_COMMIT_BATCH:
+                    await db.commit()
+                    pending = 0
+                    await asyncio.sleep(0)
+
+            if pending:
+                await db.commit()
+
+            status = self.indexing_status.setdefault(repo_id, {
                 'status': 'initializing',
                 'files_processed': 0,
-                'total_files': len(file_records),
-                'errors': []
-            }
-            logger.info(f'Repository {repo_id} uploaded with {len(file_records)} files to {repo_path}')
+                'total_files': 0,
+                'errors': [],
+            })
+            status['total_files'] = int(status.get('total_files') or 0) + added
+            logger.info(f'Repository {repo_id} stored {added} files (batch of {INDEX_COMMIT_BATCH}) at {repo_path}')
             return repo_id
         finally:
             await db.close()
@@ -459,9 +480,78 @@ class RepositoryManager():
         finally:
             (await db.close())
 
+    async def cleanup_sql(self, repo_id: Optional[str] = None) -> Dict[str, Any]:
+        """Delete file/folder rows (and related records) from SQLite.
+
+        If repo_id is set, only that repository is removed. Otherwise every
+        stored repository, file, indexing row, and snapshot is wiped.
+        """
+        db = await get_db()
+        deleted = {
+            'repositories': 0,
+            'files': 0,
+            'indexing_status': 0,
+            'snapshots': 0,
+            'repo_ids': [],
+        }
+        try:
+            if repo_id:
+                repo_ids = [repo_id]
+            else:
+                rows = (await db.execute(select(Repository.id))).all()
+                repo_ids = [row.id for row in rows]
+
+            for rid in repo_ids:
+                files_result = await db.execute(
+                    delete(RepositoryFile).where(RepositoryFile.repository_id == rid)
+                )
+                index_result = await db.execute(
+                    delete(IndexingStatus).where(IndexingStatus.repository_id == rid)
+                )
+                snap_result = await db.execute(
+                    delete(CodeSnapshot).where(CodeSnapshot.repository_id == rid)
+                )
+                repo_result = await db.execute(
+                    delete(Repository).where(Repository.id == rid)
+                )
+                deleted['files'] += files_result.rowcount or 0
+                deleted['indexing_status'] += index_result.rowcount or 0
+                deleted['snapshots'] += snap_result.rowcount or 0
+                deleted['repositories'] += repo_result.rowcount or 0
+                deleted['repo_ids'].append(rid)
+
+                if rid in self.watchers:
+                    try:
+                        self.watchers[rid].stop()
+                        self.watchers[rid].join(timeout=2)
+                    except Exception:
+                        pass
+                    self.watchers.pop(rid, None)
+                self.indexing_status.pop(rid, None)
+
+                if self.embedding_service:
+                    try:
+                        self.embedding_service.delete_collection(rid)
+                    except Exception as emb_err:
+                        logger.warning(f'Chroma cleanup failed for {rid}: {emb_err}')
+
+                repo_path = self.upload_dir / rid
+                if repo_path.exists():
+                    shutil.rmtree(repo_path, ignore_errors=True)
+
+            await db.commit()
+            logger.info(f'SQL cleanup removed {deleted}')
+            return deleted
+        except Exception as e:
+            await db.rollback()
+            logger.error(f'SQL cleanup failed: {e}')
+            raise
+        finally:
+            await db.close()
+
     def cleanup(self, repo_id: str) -> None:
-        'Clean up repository and stop file watcher'
-        if (repo_id in self.watchers):
+        'Clean up repository disk files and stop file watcher (SQL cleanup is async).'
+        if repo_id in self.watchers:
             self.watchers[repo_id].stop()
             self.watchers[repo_id].join()
             del self.watchers[repo_id]

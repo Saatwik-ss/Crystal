@@ -8,7 +8,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException, WebSocketDisconnect, Query
 from starlette.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -210,29 +210,56 @@ async def health():
     return {"status": "healthy"}
 
 @app.post("/api/upload-repository")
-async def upload_repository(files: list[UploadFile] = File(...)):
+async def upload_repository(
+    files: list[UploadFile] = File(...),
+    repo_id: Optional[str] = Query(None),
+    finalize: bool = Query(True),
+):
     """
     Upload and index a repository.
-    Accepts multiple files/folders.
+    Accepts multiple files/folders. Send at most 30 files per request
+    and pass repo_id to append; set finalize=true on the last batch to start indexing.
     """
     try:
-        repo_id = await repository_manager.process_upload(files)
-        
-        # Start indexing asynchronously
-        asyncio.create_task(
-            repository_manager.index_repository(repo_id)
-        )
-        
+        saved_id = await repository_manager.process_upload(files, repo_id=repo_id)
+
+        if finalize:
+            asyncio.create_task(repository_manager.index_repository(saved_id))
+
         return {
-            "id": repo_id,
-            "name": repo_id,
-            "path": str(repository_manager.upload_dir / repo_id),
+            "id": saved_id,
+            "name": saved_id,
+            "path": str(repository_manager.upload_dir / saved_id),
             "created_at": datetime.utcnow().isoformat() + "Z",
-            "status": "uploading",
-            "message": "Repository uploaded. Indexing started..."
+            "status": "indexing" if finalize else "uploading",
+            "message": (
+                "Repository uploaded. Indexing started..."
+                if finalize
+                else "Batch stored. Send remaining files with the same repo_id."
+            ),
         }
     except Exception as e:
         logger.error(f"Upload error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/repositories")
+async def cleanup_all_repositories():
+    """Remove every stored repository, file, and folder row from SQLite."""
+    try:
+        return await repository_manager.cleanup_sql()
+    except Exception as e:
+        logger.error(f"Cleanup all error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/repositories/{repo_id}")
+async def cleanup_repository(repo_id: str):
+    """Remove one repository's files/folders from SQLite, Chroma, and disk."""
+    try:
+        return await repository_manager.cleanup_sql(repo_id)
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/repositories/{repo_id}/status")

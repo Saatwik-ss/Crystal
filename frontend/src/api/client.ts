@@ -38,7 +38,10 @@ class APIClient {
   }
 
   // Repository endpoints
-  async uploadRepository(files: File[]): Promise<Repository> {
+  async uploadRepository(
+    files: File[],
+    options?: { repoId?: string | null; finalize?: boolean }
+  ): Promise<Repository> {
     const formData = new FormData();
     files.forEach((file) => {
       // Preserve a selected folder's relative path for the backend file tree.
@@ -46,8 +49,17 @@ class APIClient {
       formData.append('files', file, relativePath);
     });
 
+    const params: Record<string, string | boolean> = {};
+    if (options?.repoId) {
+      params.repo_id = options.repoId;
+    }
+    if (options?.finalize === false) {
+      params.finalize = false;
+    }
+
     const response = await this.client.post('/upload-repository', formData, {
       timeout: 600000,
+      params,
     });
 
     const responseData = response.data as any;
@@ -71,6 +83,28 @@ class APIClient {
       `/repositories/${repoId}/files`
     );
     return response.data.files;
+  }
+
+  async deleteRepository(repoId: string): Promise<{
+    repositories: number;
+    files: number;
+    indexing_status: number;
+    snapshots: number;
+    repo_ids: string[];
+  }> {
+    const response = await this.client.delete(`/repositories/${repoId}`);
+    return response.data;
+  }
+
+  async cleanupAllRepositories(): Promise<{
+    repositories: number;
+    files: number;
+    indexing_status: number;
+    snapshots: number;
+    repo_ids: string[];
+  }> {
+    const response = await this.client.delete('/repositories');
+    return response.data;
   }
 
   async readFile(repoId: string, filePath: string): Promise<string> {
