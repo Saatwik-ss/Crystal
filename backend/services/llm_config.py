@@ -56,6 +56,12 @@ _MODEL_MAX_COMPLETION: Dict[str, int] = {
     "moonshotai/kimi-k2-instruct": 16384,
     "groq/compound": 8192,
     "groq/compound-mini": 8192,
+    "gemini-2.5-flash": 8192,
+    "gemini-2.5-pro": 8192,
+    "gemini-2.0-flash": 8192,
+    "gemini-2.0-flash-lite": 8192,
+    "gemini-1.5-flash": 8192,
+    "gemini-1.5-pro": 8192,
 }
 
 # Not usable with chat.completions
@@ -87,9 +93,13 @@ def is_chat_model(model: str) -> bool:
 
 
 def supports_tools(model: Optional[str]) -> bool:
-    """Whether Crystal can pass function-calling `tools=` to this Groq model."""
+    """Whether Crystal can pass function-calling `tools=` to this model."""
     name = (model or "").strip().lower()
-    if not name or not is_chat_model(name):
+    if not name:
+        return False
+    if "gemini" in name:
+        return True
+    if not is_chat_model(name):
         return False
     if any(s in name for s in _NO_TOOLS_SUBSTRINGS):
         return False
@@ -463,8 +473,32 @@ def get_groq_client(
     Return (client, model_name, initialized).
     Uses the user-provided key when present; otherwise the server default.
     Rejects non-chat models (whisper, TTS, prompt-guard) and falls back to default.
+    Dynamically routes to Gemini when a Gemini API key is provided.
     """
+    from services.provider_router import (
+        detect_provider,
+        create_provider_client,
+        resolve_provider_model,
+        is_gemini_key,
+    )
+
     key = resolve_api_key(user_key)
+    if not key and os.getenv("GEMINI_API_KEY"):
+        key = os.getenv("GEMINI_API_KEY")
+
+    provider = detect_provider(key, user_model)
+    if provider == "gemini":
+        model_name = resolve_provider_model("gemini", user_model)
+        if not key:
+            return None, model_name, False
+        if (
+            fallback_client is not None
+            and fallback_key
+            and key == fallback_key
+        ):
+            return fallback_client, model_name, True
+        return create_provider_client("gemini", key, model_name)
+
     model_name = resolve_model(user_model)
     if not key:
         return None, model_name, False

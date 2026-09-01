@@ -4,10 +4,15 @@ export interface LlmSettings {
   systemPrompt: string;
 }
 
-/** Chat-capable Groq models shown in Settings (not Whisper/TTS/guard). */
+/** Chat-capable models shown in Settings (not Whisper/TTS/guard). */
 export const CHAT_MODEL_OPTIONS = [
   'llama-3.3-70b-versatile',
   'llama-3.1-8b-instant',
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'gemini-2.0-flash',
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
   'openai/gpt-oss-120b',
   'openai/gpt-oss-20b',
   'meta-llama/llama-4-scout-17b-16e-instruct',

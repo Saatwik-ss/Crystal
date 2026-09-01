@@ -18,6 +18,10 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
   const [availableModels, setAvailableModels] = useState<string[]>([
     "llama-3.1-70b-versatile",
     "llama-3.1-8b-instant",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
     "llama3-70b-8192",
     "llama3-8b-8192",
     "mixtral-8x7b-32768",
@@ -90,7 +94,7 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
           Leave fields empty to use the server defaults. Your values are stored only in this browser.
         </p>
 
-        <label className="block text-xs text-gray-400 mb-1">Groq API key</label>
+        <label className="block text-xs text-gray-400 mb-1">API key (Groq or Gemini)</label>
         <input
           type="password"
           autoComplete="off"
@@ -132,15 +136,15 @@ export default function SettingsDialog({ onClose }: SettingsDialogProps) {
             type="text"
             value={draft.model}
             onChange={(e) => setDraft((s) => ({ ...s, model: e.target.value }))}
-            placeholder="e.g. llama-3.3-70b-versatile (not whisper)"
+            placeholder="e.g. llama-3.3-70b-versatile or gemini-2.5-flash"
             className="w-full bg-gray-700 text-white placeholder-gray-500 px-3 py-2 rounded border border-gray-600 focus:border-blue-500 focus:outline-none mb-2"
           />
         )}
 
         <p className="text-xs text-gray-500 mb-4">
-          Use a function-calling chat model (e.g. llama-3.3-70b-versatile or
-          openai/gpt-oss-120b). Whisper, TTS, prompt-guard, and groq/compound are
-          not supported for Crystal&apos;s local agent tools.
+          Use a function-calling chat model (e.g. llama-3.3-70b-versatile,
+          gemini-2.5-flash, or openai/gpt-oss-120b). Whisper, TTS, prompt-guard, and
+          groq/compound are not supported for Crystal&apos;s local agent tools.
         </p>
 
         <label className="block text-xs text-gray-400 mb-1">Personal system prompt</label>

@@ -28,6 +28,7 @@ from services.code_completion_service import CodeCompletionService
 from services.tool_executor import ToolExecutor
 from services.agent_planner import AgentPlanner
 from services.edit_history import EditHistory
+from services.provider_router import detect_provider, get_provider_info, GEMINI_CHAT_MODELS
 from database.db import init_db, get_db
 from api import repository_routes, chat_routes, search_routes, completion_routes
 from pydantic import BaseModel
@@ -162,20 +163,44 @@ class ModelsRequest(BaseModel):
 async def get_models(body: ModelsRequest):
     api_key = body.api_key.strip()
     if not api_key:
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key = os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=400, detail="No API key provided")
         
+    provider = detect_provider(api_key)
+    provider_info = get_provider_info(provider)
+    models_url = provider_info["models_url"]
+
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(
-                "https://api.groq.com/openai/v1/models",
+                models_url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=10.0
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if provider == "gemini" and "data" in data and isinstance(data["data"], list):
+                chat_models = [
+                    m for m in data["data"]
+                    if "gemini" in m.get("id", "").lower()
+                    and not any(x in m.get("id", "").lower() for x in ["embedding", "imagen", "aqa"])
+                ]
+                if chat_models:
+                    data["data"] = chat_models
+                else:
+                    data["data"] = [{"id": m, "object": "model"} for m in GEMINI_CHAT_MODELS]
+            return data
         except Exception as e:
+            if provider == "gemini" and isinstance(e, httpx.HTTPStatusError):
+                err_text = str(e)
+                try:
+                    err_json = e.response.json()
+                    if "error" in err_json and "message" in err_json["error"]:
+                        err_text = err_json["error"]["message"]
+                except Exception:
+                    pass
+                raise HTTPException(status_code=400, detail=err_text)
             raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/health")
