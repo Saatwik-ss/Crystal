@@ -69,8 +69,24 @@ export default function Upload({ onUploadComplete, compact = false }: UploadProp
         readBatch();
       });
 
+    const IGNORED_NAMES = new Set([
+      'node_modules',
+      '.git',
+      'dist',
+      'build',
+      'venv',
+      '.venv',
+      '__pycache__',
+      '.next',
+      '.nuxt',
+      '.cache',
+    ]);
+
     const entries = await readAllEntries();
     for (const entry of entries) {
+      if (IGNORED_NAMES.has(entry.name)) {
+        continue;
+      }
       const nextPrefix = pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name;
       if (entry.isFile) {
         const file = await new Promise<File | null>((resolve) => {
@@ -161,8 +177,25 @@ export default function Upload({ onUploadComplete, compact = false }: UploadProp
   };
 
   const handleFileInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
+    const rawFiles = Array.from(e.target.files || []);
     e.target.value = '';
+    const IGNORED = new Set([
+      'node_modules',
+      '.git',
+      'dist',
+      'build',
+      'venv',
+      '.venv',
+      '__pycache__',
+      '.next',
+      '.nuxt',
+      '.cache',
+    ]);
+    const files = rawFiles.filter((f) => {
+      const rel = (f as any).webkitRelativePath || f.name;
+      const parts = rel.split('/');
+      return !parts.some((p: string) => IGNORED.has(p));
+    });
     await uploadFiles(files);
   };
 
