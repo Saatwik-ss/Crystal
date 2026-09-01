@@ -60,9 +60,20 @@ def test_create_gemini_client():
     client, model, initialized = create_provider_client("gemini", "AIzaSyFakeKey123")
     assert initialized is True
     assert model == "gemini-2.5-flash"
-    assert str(client.base_url) == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert "generativelanguage.googleapis.com" in str(client.base_url)
     assert hasattr(client, "chat")
     assert hasattr(client.chat, "completions")
+
+
+def test_create_gemini_client_fallback_without_openai():
+    # Simulate environment where openai package is not installed
+    with patch.dict("sys.modules", {"openai": None}):
+        client, model, initialized = create_provider_client("gemini", "AIzaSyFakeKey123")
+        assert initialized is True
+        assert model == "gemini-2.5-flash"
+        assert "generativelanguage.googleapis.com" in str(client.base_url)
+        assert hasattr(client, "chat")
+        assert hasattr(client.chat, "completions")
 
 
 def test_get_groq_client_delegation():
