@@ -4,6 +4,7 @@ import shutil
 import asyncio
 import threading
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 from datetime import datetime
@@ -54,6 +55,8 @@ class RepositoryFileWatcher(FileSystemEventHandler):
 
 INDEX_COMMIT_BATCH = 50
 MAX_INDEX_ERRORS = 50
+# Dedicated pool so indexing I/O never starves aiosqlite (default executor).
+_INDEX_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="crystal-index")
 
 class RepositoryManager():
 
@@ -136,7 +139,7 @@ class RepositoryManager():
             chunking_service = ChunkingService(ast_service)
             loop = asyncio.get_running_loop()
             try:
-                await loop.run_in_executor(None, embedding_service.reset_collection, repo_id)
+                await loop.run_in_executor(_INDEX_POOL, embedding_service.reset_collection, repo_id)
             except Exception as reset_err:
                 logger.warning(f"Could not reset Chroma collection for {repo_id}: {reset_err}")
 
@@ -155,7 +158,7 @@ class RepositoryManager():
                     relative_path = file_path.relative_to(repo_path).as_posix()
                     file_size = file_path.stat().st_size
                     content = await loop.run_in_executor(
-                        None,
+                        _INDEX_POOL,
                         lambda p=file_path: p.read_text(encoding='utf-8', errors='ignore'),
                     )
                     ext = file_path.suffix.lower()
@@ -164,7 +167,7 @@ class RepositoryManager():
                     if language in ['python', 'javascript', 'typescript'] and file_size < 300 * 1024:
                         try:
                             ast_data = await loop.run_in_executor(
-                                None, ast_service.parse_file, content, language
+                                _INDEX_POOL, ast_service.parse_file, content, language
                             )
                         except Exception as ast_err:
                             logger.warning(f"AST parsing failed for {relative_path}: {ast_err}")
@@ -222,13 +225,16 @@ class RepositoryManager():
 
             if pending_since_commit:
                 await db.commit()
+            await db.close()
+            db = None
+
+            self.indexing_status[repo_id]['status'] = 'completed'
+            logger.info(f'Repository {repo_id} indexing completed successfully')
+
             try:
                 await self._build_dependency_graph(repo_id)
             except Exception as dg_err:
                 logger.warning(f"Dependency graph building failed: {dg_err}")
-
-            self.indexing_status[repo_id]['status'] = 'completed'
-            logger.info(f'Repository {repo_id} indexing completed successfully')
         except Exception as e:
             logger.error(f'Repository indexing failed for {repo_id}: {e}')
             if repo_id in self.indexing_status:
@@ -278,7 +284,7 @@ class RepositoryManager():
                     files.append(item)
             return sorted(files)
 
-        return await asyncio.get_running_loop().run_in_executor(None, collect)
+        return await asyncio.get_running_loop().run_in_executor(_INDEX_POOL, collect)
 
     def _get_language(self, extension: str) -> str:
         """Map file extension to language"""
@@ -325,16 +331,25 @@ class RepositoryManager():
         try:
             db = (await get_db())
             ast_service = ASTService()
-            files = (await db.scalars(select(RepositoryFile).where((RepositoryFile.repository_id == repo_id), (RepositoryFile.language == 'python')))).all()
+            files = (await db.execute(
+                select(RepositoryFile.path).where(
+                    (RepositoryFile.repository_id == repo_id),
+                    (RepositoryFile.language == 'python'),
+                )
+            )).all()
             dependency_graph = {}
-            for file in files:
-                repo_path = (self.upload_dir / repo_id)
-                file_path = (repo_path / file.path)
-                content = file_path.read_text(encoding='utf-8', errors='ignore')
-                ast_data = ast_service.parse_file(content, 'python')
-                if ast_data:
-                    imports = ast_data.get('imports', [])
-                    dependency_graph[file.path] = imports
+            repo_path = (self.upload_dir / repo_id)
+            for idx, row in enumerate(files[:400]):
+                file_path = (repo_path / row.path)
+                try:
+                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    ast_data = ast_service.parse_file(content, 'python')
+                    if ast_data:
+                        dependency_graph[row.path] = ast_data.get('imports', [])
+                except Exception as parse_err:
+                    logger.debug(f"Dependency parse skipped for {row.path}: {parse_err}")
+                if idx % 20 == 19:
+                    await asyncio.sleep(0)
             repository = (await db.get(Repository, repo_id))
             if repository:
                 repository.repo_metadata = {'dependencies': dependency_graph}
@@ -363,8 +378,15 @@ class RepositoryManager():
 
     async def get_repository_status(self, repo_id: str) -> Dict[(str, Any)]:
         'Get current indexing status'
-        status = self.indexing_status.get(repo_id, {})
-        return {'repository_id': repo_id, **status}
+        status = self.indexing_status.get(repo_id) or {}
+        return {
+            'repository_id': repo_id,
+            'status': status.get('status') or 'indexing',
+            'files_processed': int(status.get('files_processed') or 0),
+            'total_files': int(status.get('total_files') or 0),
+            'errors': status.get('errors') or [],
+            **({'error': status['error']} if status.get('error') else {}),
+        }
 
     async def list_files(self, repo_id: str) -> List[Dict[(str, Any)]]:
         'List all files in repository'

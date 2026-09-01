@@ -11,7 +11,9 @@ export default function IndexingStatus() {
     total_files > 0 ? Math.round((files_processed / total_files) * 100) : 0;
 
   const isFailed = status === 'failed';
-  const isDone = status === 'completed';
+  const isDone =
+    status === 'completed' ||
+    (total_files > 0 && files_processed >= total_files);
 
   if (isFailed) {
     return (

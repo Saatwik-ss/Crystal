@@ -34,7 +34,11 @@ export function useRepositoryIndexing() {
 
         setIndexingStatus(status);
 
-        if (status.status === 'completed' || status.status === 'failed') {
+        const finished =
+          status.status === 'completed' ||
+          status.status === 'failed' ||
+          (status.total_files > 0 && status.files_processed >= status.total_files);
+        if (finished) {
           await loadFiles();
           return true;
         }

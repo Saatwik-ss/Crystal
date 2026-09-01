@@ -240,7 +240,6 @@ class EmbeddingService:
                     "sub_chunk_count": int(c.get("sub_chunk_count") or 1),
                 })
 
-            # Upsert to avoid duplicate-id errors on partial reindex
             collection.upsert(
                 ids=ids,
                 embeddings=embeddings,
