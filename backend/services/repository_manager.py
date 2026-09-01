@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 import logging
-import json
 from sqlalchemy import select
 from fastapi import UploadFile
 from watchdog.observers import Observer
@@ -53,13 +52,17 @@ class RepositoryFileWatcher(FileSystemEventHandler):
         except Exception as e:
             logger.error(f"Error triggering re-index for {self.repo_id}: {e}")
 
+INDEX_COMMIT_BATCH = 50
+MAX_INDEX_ERRORS = 50
+
 class RepositoryManager():
 
-    def __init__(self):
+    def __init__(self, embedding_service: Optional[EmbeddingService] = None):
         self.upload_dir = UPLOAD_DIR
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.watchers: Dict[(str, Observer)] = {}
         self.indexing_status: Dict[(str, Dict[(str, Any)])] = {}
+        self.embedding_service = embedding_service
 
     async def process_upload(self, files: List[UploadFile]) -> str:
         """Process uploaded files and create repository with immediate file records"""
@@ -67,7 +70,7 @@ class RepositoryManager():
         repo_path = (self.upload_dir / repo_id)
         repo_path.mkdir(parents=True, exist_ok=True)
         file_records = []
-        for file in files:
+        for idx, file in enumerate(files):
             relative_name = file.filename.replace('\\', '/')
             file_path = (repo_path / relative_name)
             file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +87,8 @@ class RepositoryManager():
                     size=len(contents),
                 )
             )
+            if idx % 25 == 24:
+                await asyncio.sleep(0)
         db = await get_db()
         try:
             repository = Repository(id=repo_id, name=repo_id, path=str(repo_path), created_at=datetime.utcnow())
@@ -102,6 +107,11 @@ class RepositoryManager():
         finally:
             await db.close()
 
+    def _record_index_error(self, repo_id: str, message: str) -> None:
+        errors = self.indexing_status.setdefault(repo_id, {}).setdefault('errors', [])
+        if len(errors) < MAX_INDEX_ERRORS:
+            errors.append(message)
+
     async def index_repository(self, repo_id: str) -> None:
         """
         Index repository: generate AST, embeddings, and dependency graph.
@@ -109,16 +119,24 @@ class RepositoryManager():
         """
         db = None
         try:
+            if repo_id not in self.indexing_status:
+                self.indexing_status[repo_id] = {
+                    'status': 'indexing',
+                    'files_processed': 0,
+                    'total_files': 0,
+                    'errors': [],
+                }
             repo_path = (self.upload_dir / repo_id)
             self.indexing_status[repo_id]['status'] = 'indexing'
             files = await self._traverse_repository(repo_path)
             self.indexing_status[repo_id]['total_files'] = len(files)
             db = await get_db()
             ast_service = ASTService()
-            embedding_service = EmbeddingService()
+            embedding_service = self.embedding_service or EmbeddingService()
             chunking_service = ChunkingService(ast_service)
+            loop = asyncio.get_running_loop()
             try:
-                embedding_service.reset_collection(repo_id)
+                await loop.run_in_executor(None, embedding_service.reset_collection, repo_id)
             except Exception as reset_err:
                 logger.warning(f"Could not reset Chroma collection for {repo_id}: {reset_err}")
 
@@ -131,17 +149,23 @@ class RepositoryManager():
                 '.lock', '.csv', '.tsv', '.jsonl'
             }
 
+            pending_since_commit = 0
             for (idx, file_path) in enumerate(files):
                 try:
                     relative_path = file_path.relative_to(repo_path).as_posix()
                     file_size = file_path.stat().st_size
-                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    content = await loop.run_in_executor(
+                        None,
+                        lambda p=file_path: p.read_text(encoding='utf-8', errors='ignore'),
+                    )
                     ext = file_path.suffix.lower()
                     language = self._get_language(ext)
                     ast_data = None
                     if language in ['python', 'javascript', 'typescript'] and file_size < 300 * 1024:
                         try:
-                            ast_data = ast_service.parse_file(content, language)
+                            ast_data = await loop.run_in_executor(
+                                None, ast_service.parse_file, content, language
+                            )
                         except Exception as ast_err:
                             logger.warning(f"AST parsing failed for {relative_path}: {ast_err}")
 
@@ -155,7 +179,7 @@ class RepositoryManager():
                     if existing:
                         existing.language = language
                         existing.content_hash = self._hash_content(content)
-                        existing.ast_data = (json.dumps(ast_data) if ast_data else None)
+                        existing.ast_data = ast_data
                         existing.size = len(content)
                     else:
                         repo_file = RepositoryFile(
@@ -163,7 +187,7 @@ class RepositoryManager():
                             path=str(relative_path),
                             language=language,
                             content_hash=self._hash_content(content),
-                            ast_data=(json.dumps(ast_data) if ast_data else None),
+                            ast_data=ast_data,
                             size=len(content)
                         )
                         db.add(repo_file)
@@ -181,13 +205,23 @@ class RepositoryManager():
                                 await embedding_service.store_symbol_embeddings(repo_id, chunks[:20])
                         except Exception as emb_err:
                             logger.warning(f"Embedding failed for {relative_path}: {emb_err}")
+                            self._record_index_error(repo_id, f"{relative_path}: {emb_err}")
+
+                    pending_since_commit += 1
+                    if pending_since_commit >= INDEX_COMMIT_BATCH:
+                        await db.commit()
+                        pending_since_commit = 0
 
                     self.indexing_status[repo_id]['files_processed'] = (idx + 1)
                 except Exception as e:
                     logger.error(f'Error processing file {file_path}: {e}')
-                    self.indexing_status[repo_id]['errors'].append(str(e))
+                    self._record_index_error(repo_id, str(e))
+                    self.indexing_status[repo_id]['files_processed'] = (idx + 1)
 
-            await db.commit()
+                await asyncio.sleep(0)
+
+            if pending_since_commit:
+                await db.commit()
             try:
                 await self._build_dependency_graph(repo_id)
             except Exception as dg_err:
@@ -197,8 +231,9 @@ class RepositoryManager():
             logger.info(f'Repository {repo_id} indexing completed successfully')
         except Exception as e:
             logger.error(f'Repository indexing failed for {repo_id}: {e}')
-            self.indexing_status[repo_id]['status'] = 'failed'
-            self.indexing_status[repo_id]['error'] = str(e)
+            if repo_id in self.indexing_status:
+                self.indexing_status[repo_id]['status'] = 'failed'
+                self.indexing_status[repo_id]['error'] = str(e)
         finally:
             if db:
                 await db.close()
@@ -216,7 +251,6 @@ class RepositoryManager():
 
     async def _traverse_repository(self, repo_path: Path) -> List[Path]:
         """Recursively traverse repository and collect code and text files."""
-        files = []
 
         def should_ignore(path: Path) -> bool:
             for part in path.parts:
@@ -237,10 +271,14 @@ class RepositoryManager():
                 return True
             return False
 
-        for item in repo_path.rglob('*'):
-            if item.is_file() and not should_ignore(item):
-                files.append(item)
-        return sorted(files)
+        def collect() -> List[Path]:
+            files = []
+            for item in repo_path.rglob('*'):
+                if item.is_file() and not should_ignore(item):
+                    files.append(item)
+            return sorted(files)
+
+        return await asyncio.get_running_loop().run_in_executor(None, collect)
 
     def _get_language(self, extension: str) -> str:
         """Map file extension to language"""
@@ -332,8 +370,12 @@ class RepositoryManager():
         'List all files in repository'
         db = (await get_db())
         try:
-            files = (await db.scalars(select(RepositoryFile).where((RepositoryFile.repository_id == repo_id)))).all()
-            return [{'path': f.path, 'language': f.language, 'size': f.size} for f in files]
+            rows = (await db.execute(
+                select(RepositoryFile.path, RepositoryFile.language, RepositoryFile.size).where(
+                    (RepositoryFile.repository_id == repo_id)
+                )
+            )).all()
+            return [{'path': r.path, 'language': r.language, 'size': r.size} for r in rows]
         finally:
             (await db.close())
 
@@ -384,9 +426,14 @@ class RepositoryManager():
         'Get comprehensive repository context for LLM'
         db = (await get_db())
         try:
-            files = (await db.scalars(select(RepositoryFile).where((RepositoryFile.repository_id == repo_id)))).all()
-            context = {'files': [{'path': f.path, 'language': f.language, 'ast': (json.loads(f.ast_data) if f.ast_data else None)} for f in files], 'total_files': len(files), 'languages': list(set((f.language for f in files)))}
-            return context
+            rows = (await db.execute(
+                select(RepositoryFile.path, RepositoryFile.language).where(
+                    (RepositoryFile.repository_id == repo_id)
+                )
+            )).all()
+            files = [{'path': r.path, 'language': r.language} for r in rows]
+            languages = list({r.language for r in rows if r.language})
+            return {'files': files, 'total_files': len(files), 'languages': languages}
         finally:
             (await db.close())
 

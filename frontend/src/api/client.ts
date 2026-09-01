@@ -27,6 +27,8 @@ class APIClient {
     reject: (error: Error) => void;
     buffer: string;
   } | null = null;
+  private closingKeys = new Set<string>();
+  private chatFirstChunkWatchdog: number | null = null;
 
   constructor() {
     this.client = axios.create({
@@ -43,7 +45,9 @@ class APIClient {
       formData.append('files', file, relativePath);
     });
 
-    const response = await this.client.post('/upload-repository', formData);
+    const response = await this.client.post('/upload-repository', formData, {
+      timeout: 600000,
+    });
 
     const responseData = response.data as any;
     const repository = responseData.repository ?? responseData;
@@ -130,6 +134,14 @@ class APIClient {
     ws.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
+        const isBootstrap =
+          message?.type === 'planning' &&
+          typeof message.content === 'string' &&
+          message.content.startsWith('Loading repository');
+        if (!isBootstrap && this.chatFirstChunkWatchdog != null) {
+          window.clearTimeout(this.chatFirstChunkWatchdog);
+          this.chatFirstChunkWatchdog = null;
+        }
         onMessage(message);
       } catch (error) {
         console.error('Failed to parse chat message:', error);
@@ -142,8 +154,20 @@ class APIClient {
     };
 
     ws.onclose = () => {
+      if (this.chatFirstChunkWatchdog != null) {
+        window.clearTimeout(this.chatFirstChunkWatchdog);
+        this.chatFirstChunkWatchdog = null;
+      }
+      const intentional = this.closingKeys.has(key);
+      this.closingKeys.delete(key);
       if (this.wsConnections.get(key) === ws) {
         this.wsConnections.delete(key);
+      }
+      if (!intentional) {
+        onMessage({
+          type: 'error',
+          error: 'Chat connection closed unexpectedly',
+        });
       }
     };
 
@@ -181,6 +205,25 @@ class APIClient {
       enable_planning: enablePlanning,
       ...(settings ? llmPayload(settings) : {}),
     }));
+
+    if (this.chatFirstChunkWatchdog != null) {
+      window.clearTimeout(this.chatFirstChunkWatchdog);
+    }
+    this.chatFirstChunkWatchdog = window.setTimeout(() => {
+      this.chatFirstChunkWatchdog = null;
+      const live = this.wsConnections.get(`chat_${id}`);
+      if (live === ws) {
+        const handler = live.onmessage;
+        if (handler) {
+          handler({
+            data: JSON.stringify({
+              type: 'error',
+              error: 'Chat timed out waiting for a response',
+            }),
+          } as MessageEvent);
+        }
+      }
+    }, 45000);
   }
 
   // Completion WebSocket
@@ -349,6 +392,9 @@ class APIClient {
 
   // Cleanup
   closeConnections(): void {
+    this.wsConnections.forEach((_ws, key) => {
+      this.closingKeys.add(key);
+    });
     this.wsConnections.forEach((ws) => {
       if (
         ws.readyState === WebSocket.OPEN ||
@@ -365,6 +411,7 @@ class APIClient {
   }
 
   closeConnection(key: string): void {
+    this.closingKeys.add(key);
     const ws = this.wsConnections.get(key);
     if (
       ws &&

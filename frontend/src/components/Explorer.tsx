@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useAppStore } from '../store';
 import { apiClient } from '../api/client';
 import { ChevronRight, ChevronDown, File, Folder, Download } from 'lucide-react';
@@ -34,6 +34,11 @@ export default function Explorer() {
   const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [fileTree, setFileTree] = useState<FileTree>({});
+  const autoExpandedRepo = useRef<string | null>(null);
+
+  useEffect(() => {
+    autoExpandedRepo.current = null;
+  }, [currentRepository?.id]);
 
   useEffect(() => {
     if (!repositoryFiles.length) {
@@ -59,7 +64,22 @@ export default function Explorer() {
     });
 
     setFileTree(tree);
-  }, [repositoryFiles]);
+
+    const repoId = currentRepository?.id;
+    if (!repoId || autoExpandedRepo.current === repoId) {
+      return;
+    }
+    const firstNested = repositoryFiles
+      .map((file) => normalizePath(file.path).split('/').filter(Boolean))
+      .find((parts) => parts.length > 1);
+    if (firstNested) {
+      const top = firstNested[0];
+      if (!expandedFolders.has(top)) {
+        toggleFolder(top);
+      }
+    }
+    autoExpandedRepo.current = repoId;
+  }, [repositoryFiles, currentRepository?.id, toggleFolder]);
 
   
   const handleDownload = async (e: React.MouseEvent, filePath: string) => {

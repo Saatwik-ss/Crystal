@@ -162,14 +162,16 @@ export default function Upload({ onUploadComplete, compact = false }: UploadProp
       onUploadComplete();
     } catch (err) {
       const message =
-        err instanceof Error && 'response' in err
-          ? String(
-              (err as { response?: { data?: { detail?: string } } }).response?.data
-                ?.detail || err.message
-            )
-          : err instanceof Error
-            ? err.message
-            : 'Upload failed';
+        err instanceof Error && (err as { code?: string }).code === 'ECONNABORTED'
+          ? 'Upload timed out. Try a smaller folder or wait for a slower network.'
+          : err instanceof Error && 'response' in err
+            ? String(
+                (err as { response?: { data?: { detail?: string } } }).response?.data
+                  ?.detail || err.message
+              )
+            : err instanceof Error
+              ? err.message
+              : 'Upload failed';
       setError(message);
     } finally {
       setIsUploading(false);

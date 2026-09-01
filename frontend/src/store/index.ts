@@ -500,6 +500,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
       }
 
       if (message.type === 'error') {
+        if (!state.isStreaming && !state.streamingContent) {
+          return state;
+        }
         return {
           streamingContent: '',
           isStreaming: false,

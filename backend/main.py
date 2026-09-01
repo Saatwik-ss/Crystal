@@ -73,8 +73,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     
     # Initialize services
-    repository_manager = RepositoryManager()
     embedding_service = EmbeddingService()
+    repository_manager = RepositoryManager(embedding_service=embedding_service)
     ast_service = ASTService()
     search_service = SearchService(embedding_service)
     chat_service = ChatService()
@@ -351,7 +351,12 @@ async def websocket_chat(websocket: WebSocket, repo_id: str):
             api_key_val = data.get("api_key")
             key_preview = f"{api_key_val[:6]}... (len {len(api_key_val)})" if api_key_val else "None (using server env)"
             print(f"[{msg_ts}] [UUID: {ws_id}] \033[92m[HEALTH: OK]\033[0m WS /ws/chat/{repo_id} -> RECEIVED_MSG: \"{msg_snippet}\" | key: {key_preview} | model: {data.get('model') or 'default'}", flush=True)
-            
+
+            await websocket.send_json({
+                "type": "planning",
+                "content": "Loading repository context…",
+            })
+
             # Local session (no uploaded repo) gets empty context
             if repo_id in ("local", "none", "__none__"):
                 repo_context = {"files": [], "total_files": 0, "languages": []}
